@@ -23,8 +23,8 @@ dependencies {
     compileOnly("com.coderxi.plugin.fakeplayer:api:dev")
 }
 
-// FakePlayerPlus được build bằng JDK 25 nên class của API có version 69. Vì vậy
-// addon phải compile bằng JDK 25. Vẫn giữ release 21 để jar chạy trên server Java 21.
+// FakePlayerPlus được build bằng JDK 25 (class version 69), nên addon cũng dùng JDK 25
+// và release 25. Server phải chạy Java 25 để cả FakePlayerPlus lẫn addon chạy được.
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(25))
@@ -33,7 +33,7 @@ java {
 
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
-    options.release.set(21)
+    options.release.set(25)
 }
 
 tasks.processResources {

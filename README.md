@@ -39,7 +39,7 @@ Lệnh `/fp action start mine` không kèm tham số vẫn mở GUI gốc của 
 
 ## Cài đặt
 
-Addon cần FakePlayerPlus đã cài trên server.
+Addon cần FakePlayerPlus đã cài trên server. Server phải chạy Java 25, vì FakePlayerPlus được build cho Java 25.
 
 ### Build
 
@@ -51,7 +51,7 @@ Addon cần FakePlayerPlus đã cài trên server.
 
    Lệnh này tạo artifact `com.coderxi.plugin.fakeplayer:api:dev`, mà `build.gradle.kts` của addon đang dùng.
 
-2. Build addon (cần JDK 25 để build, vì API của FakePlayerPlus được build bằng JDK 25; jar vẫn chạy trên server Java 21. Dùng Gradle 9.x hoặc `gradle` thay cho `./gradlew`):
+2. Build addon (cần JDK 25; dùng Gradle 9.x hoặc `gradle` thay cho `./gradlew`):
 
    ```
    ./gradlew build
