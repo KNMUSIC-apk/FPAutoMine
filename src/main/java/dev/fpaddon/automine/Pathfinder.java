@@ -22,14 +22,22 @@ import java.util.Set;
  * Tìm đường A* trên lưới block (không dùng API của Paper để đi đường).
  * Một {@link Pos} là toạ độ block mà CHÂN bot đứng trong đó; đầu nằm ở y+1,
  * và mặt đất đỡ chân nằm ở y-1.
+ *
+ * <p>Có hai chế độ: đi bộ thuần ({@link #find}) và chế độ build ({@link #findBuild}),
+ * trong đó được phép phá block chắn đường và đặt block lấp chỗ hổng dưới chân.
  */
 final class Pathfinder {
 
     static final int MAX_NODES = 6000;
+    static final int MAX_BUILD_NODES = 12000;
     static final int MAX_RADIUS = 48;
     static final int MAX_DY = 16;
     /** Chiều cao mắt của người chơi (block). */
     static final double EYE_HEIGHT = 1.62;
+    /** Chi phí phụ khi phải phá một block chắn đường. */
+    static final double CLEAR_COST = 2.0;
+    /** Chi phí phụ khi phải đặt một block lấp đất đỡ. */
+    static final double PLACE_COST = 2.0;
 
     private static final int[] DX = {1, -1, 0, 0};
     private static final int[] DZ = {0, 0, 1, -1};
@@ -40,6 +48,13 @@ final class Pathfinder {
             Material.CACTUS, Material.MAGMA_BLOCK, Material.SWEET_BERRY_BUSH,
             Material.POWDER_SNOW, Material.BUBBLE_COLUMN, Material.CAMPFIRE,
             Material.SOUL_CAMPFIRE, Material.WITHER_ROSE);
+
+    /** Block không bao giờ được phá khi mở đường. */
+    private static final Set<Material> UNBREAKABLE = EnumSet.of(
+            Material.BEDROCK, Material.BARRIER, Material.COMMAND_BLOCK, Material.CHAIN_COMMAND_BLOCK,
+            Material.REPEATING_COMMAND_BLOCK, Material.STRUCTURE_BLOCK, Material.JIGSAW,
+            Material.END_PORTAL_FRAME, Material.END_GATEWAY, Material.REINFORCED_DEEPSLATE,
+            Material.LIGHT, Material.SPAWNER);
 
     record Pos(int x, int y, int z) {
         Pos offset(int dx, int dy, int dz) {
@@ -73,12 +88,25 @@ final class Pathfinder {
     }
 
     /**
-     * Tìm đường từ {@code start} tới một ô thoả {@code goal}.
+     * Tìm đường đi bộ từ {@code start} tới một ô thoả {@code goal}.
      *
      * @param hint         điểm ước lượng để định hướng A* (có thể null)
      * @param bestEffort   nếu không tới được đích, trả về đường tới ô gần {@code hint} nhất
      */
     static Result find(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean bestEffort) {
+        return search(world, start, goal, hint, maxNodes, bestEffort, false, false);
+    }
+
+    /**
+     * Tìm đường cho phép phá block chắn và (nếu {@code canPlace}) đặt block lấp đất đỡ.
+     * Dùng khi đường đi bộ thường không tới được đích.
+     */
+    static Result findBuild(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean canPlace) {
+        return search(world, start, goal, hint, maxNodes, false, true, canPlace);
+    }
+
+    private static Result search(World world, Pos start, Goal goal, Pos hint, int maxNodes,
+                                 boolean bestEffort, boolean build, boolean canPlace) {
         if (goal.test(start)) {
             return new Result(Collections.emptyList(), true);
         }
@@ -111,15 +139,23 @@ final class Pathfinder {
                             || Math.abs(next.y() - start.y()) > MAX_DY) {
                         continue;
                     }
+                    double extra = 0.0;
                     // Bước lên 1 block cần chỗ trống ở trên đầu vị trí hiện tại.
                     if (step == 1 && !passable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z())) {
+                        if (!build || !clearable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z())) {
+                            continue;
+                        }
+                        extra += CLEAR_COST;
+                    }
+                    if (closed.contains(next)) {
                         continue;
                     }
-                    if (closed.contains(next) || !walkable(world, next)) {
+                    double enter = enterCost(world, next, build, canPlace);
+                    if (enter < 0) {
                         continue;
                     }
-                    double cost = step == 0 ? 1.0 : (step == 1 ? 1.5 : 1.2);
-                    double ng = cur.g() + cost;
+                    double base = step == 0 ? 1.0 : (step == 1 ? 1.5 : 1.2);
+                    double ng = cur.g() + base + extra + enter;
                     Double old = bestG.get(next);
                     if (old != null && old <= ng) {
                         continue;
@@ -171,10 +207,57 @@ final class Pathfinder {
         return m.isSolid() && !HAZARDS.contains(m);
     }
 
+    /**
+     * Có thể phá block này để mở đường: là chất rắn, không phải chất nguy hiểm,
+     * không bất khả phá và không phải vật chứa đồ (tránh làm mất đồ trong rương).
+     */
+    static boolean clearable(World world, int x, int y, int z) {
+        if (!inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+            return false;
+        }
+        Material m = world.getBlockAt(x, y, z).getType();
+        return m.isSolid() && !HAZARDS.contains(m) && !UNBREAKABLE.contains(m) && !protectedBlock(m);
+    }
+
+    /** Vật chứa đồ hoặc tile entity quan trọng: không phá block loại này. */
+    static boolean protectedBlock(Material m) {
+        String n = m.name();
+        return n.endsWith("CHEST") || n.endsWith("SHULKER_BOX") || n.endsWith("FURNACE")
+                || n.endsWith("DISPENSER") || n.endsWith("DROPPER")
+                || n.equals("BARREL") || n.equals("HOPPER") || n.equals("BREWING_STAND")
+                || n.equals("SMOKER") || n.equals("LECTERN") || n.equals("JUKEBOX")
+                || n.equals("BEACON") || n.equals("ENCHANTING_TABLE");
+    }
+
+    /**
+     * Chi phí để bot đứng vào ô {@code p} (chân và đầu thoáng, có đất đỡ).
+     * Trả về -1 nếu không đi được; ở chế độ build, phần bị chắn/hổng được tính thêm chi phí.
+     */
+    private static double enterCost(World world, Pos p, boolean build, boolean canPlace) {
+        double cost = 0.0;
+        if (!passable(world, p.x(), p.y(), p.z())) {
+            if (!build || !clearable(world, p.x(), p.y(), p.z())) {
+                return -1;
+            }
+            cost += CLEAR_COST;
+        }
+        if (!passable(world, p.x(), p.y() + 1, p.z())) {
+            if (!build || !clearable(world, p.x(), p.y() + 1, p.z())) {
+                return -1;
+            }
+            cost += CLEAR_COST;
+        }
+        if (!supports(world, p.x(), p.y() - 1, p.z())) {
+            if (!build || !canPlace || !passable(world, p.x(), p.y() - 1, p.z())) {
+                return -1;
+            }
+            cost += PLACE_COST;
+        }
+        return cost;
+    }
+
     static boolean walkable(World world, Pos p) {
-        return passable(world, p.x(), p.y(), p.z())
-                && passable(world, p.x(), p.y() + 1, p.z())
-                && supports(world, p.x(), p.y() - 1, p.z());
+        return enterCost(world, p, false, false) >= 0;
     }
 
     /**

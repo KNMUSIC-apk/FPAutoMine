@@ -83,6 +83,8 @@ final class AutoMineSession {
     private int stuckCounter;
     private Location lastCheck;
     private StoreReason pendingStore;
+    /** Đường hiện tại được tính ở chế độ build: có thể phải phá hoặc đặt block khi đi. */
+    private boolean buildPath;
 
     // --- đào ---
     private Block target;
@@ -220,7 +222,7 @@ final class AutoMineSession {
         return null;
     }
 
-    /** Quét các block cùng loại quanh bot (chỉ chunk đã load), gần nhất đứng trước. */
+    /** Quét các block cùng loại quanh bot (chỉ chunk đã load), sắp theo thứ tự ưu tiên đào. */
     private void scan(Player p) {
         candidates.clear();
         World world = p.getWorld();
@@ -244,9 +246,19 @@ final class AutoMineSession {
                 }
             }
         }
-        found.sort(Comparator.comparingDouble(b -> distanceSquared(b, loc)));
+        // Thứ tự đào: theo lớp (khoảng cách Chebyshev) tăng dần; trong cùng lớp theo
+        // trái→phải (x), rồi trước→sau (z), rồi trên→dưới (y).
+        found.sort(Comparator
+                .comparingInt((Block b) -> layer(b, bx, by, bz))
+                .thenComparingInt(b -> b.getX() - bx)
+                .thenComparingInt(b -> b.getZ() - bz)
+                .thenComparingInt(b -> by - b.getY()));
         candidates.addAll(found);
         scanOrigin = loc.clone();
+    }
+
+    private static int layer(Block b, int bx, int by, int bz) {
+        return Math.max(Math.abs(b.getX() - bx), Math.max(Math.abs(b.getY() - by), Math.abs(b.getZ() - bz)));
     }
 
     private void startExplore(Player p) {
@@ -277,6 +289,7 @@ final class AutoMineSession {
         walkTicks = 0;
         stuckCounter = 0;
         lastCheck = null;
+        buildPath = false;
         phase = Phase.WALK;
     }
 
@@ -306,6 +319,10 @@ final class AutoMineSession {
 
         Pathfinder.Pos next = path.get(pathIndex);
         Location loc = p.getLocation();
+        if (buildPath && !prepareStep(p, nms, Pathfinder.feetCell(loc), next)) {
+            walkFailed(fp, action);
+            return;
+        }
         double cx = next.x() + 0.5;
         double cz = next.z() + 0.5;
         double dx = cx - loc.getX();
@@ -372,6 +389,83 @@ final class AutoMineSession {
             }
             case EXPLORE -> phase = Phase.PLAN;
         }
+    }
+
+    // -------------------------------------------- PHÁ / ĐẶT BLOCK KHI ĐI (build)
+
+    /**
+     * Chuẩn bị bước sang ô {@code next} trên đường build: phá block chắn ở chân và đầu,
+     * phá block trên đầu bot khi phải nhảy lên, đặt block lấp đất đỡ nếu thiếu.
+     * Trả về false nếu không làm được (không đủ block để đặt, hoặc block quá xa).
+     */
+    private boolean prepareStep(Player p, NMSServerPlayer nms, Pathfinder.Pos from, Pathfinder.Pos next) {
+        World w = p.getWorld();
+        if (next.y() > from.y() && !Pathfinder.passable(w, from.x(), from.y() + 2, from.z())
+                && !clearBlock(p, nms, w.getBlockAt(from.x(), from.y() + 2, from.z()))) {
+            return false;
+        }
+        if (!Pathfinder.passable(w, next.x(), next.y(), next.z())
+                && !clearBlock(p, nms, w.getBlockAt(next.x(), next.y(), next.z()))) {
+            return false;
+        }
+        if (!Pathfinder.passable(w, next.x(), next.y() + 1, next.z())
+                && !clearBlock(p, nms, w.getBlockAt(next.x(), next.y() + 1, next.z()))) {
+            return false;
+        }
+        if (!Pathfinder.supports(w, next.x(), next.y() - 1, next.z())) {
+            return placeSupport(p, w.getBlockAt(next.x(), next.y() - 1, next.z()));
+        }
+        return true;
+    }
+
+    /** Phá một block chắn bằng công cụ tốt nhất trong túi; block rơi ra được nhặt sau. */
+    private boolean clearBlock(Player p, NMSServerPlayer nms, Block b) {
+        if (!Pathfinder.clearable(b.getWorld(), b.getX(), b.getY(), b.getZ())
+                || b.getLocation().distance(p.getLocation()) > REACH_LIMIT + 1.0) {
+            return false;
+        }
+        selectTool(p, nms, b);
+        b.breakNaturally(p.getInventory().getItemInMainHand());
+        return true;
+    }
+
+    /** Đặt một block từ túi vào ô đất đỡ bị hổng. */
+    private static boolean placeSupport(Player p, Block support) {
+        if (support.getLocation().distance(p.getLocation()) > REACH_LIMIT + 1.0) {
+            return false;
+        }
+        PlayerInventory inv = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = inv.getItem(i);
+            if (s == null || !canPlaceAsSupport(s.getType())) {
+                continue;
+            }
+            support.setType(s.getType(), true);
+            if (s.getAmount() <= 1) {
+                inv.setItem(i, null);
+            } else {
+                s.setAmount(s.getAmount() - 1);
+                inv.setItem(i, s);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** Block dùng để lấp hổng: chất rắn, không bị rơi (cát, sỏi), không phải vật chứa. */
+    private static boolean canPlaceAsSupport(Material m) {
+        return m.isBlock() && m.isSolid() && !m.hasGravity() && !Pathfinder.protectedBlock(m);
+    }
+
+    private static boolean canPlaceBlocks(Player p) {
+        PlayerInventory inv = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = inv.getItem(i);
+            if (s != null && canPlaceAsSupport(s.getType())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------ MINE
@@ -548,6 +642,16 @@ final class AutoMineSession {
             if (r.reached()) {
                 pendingStore = reason;
                 startWalk(WalkKind.CHEST, chest, null, r.path());
+                return;
+            }
+            // Không với tới bằng đường đi bộ: thử đường được phép phá và đặt block.
+            Pathfinder.Result built = Pathfinder.findBuild(world, stand,
+                    cell -> Pathfinder.distToCenter(cell, chest) <= 3.0, key, Pathfinder.MAX_BUILD_NODES,
+                    canPlaceBlocks(p));
+            if (built.reached()) {
+                pendingStore = reason;
+                startWalk(WalkKind.CHEST, chest, null, built.path());
+                buildPath = true;
                 return;
             }
             fullChests.add(key);

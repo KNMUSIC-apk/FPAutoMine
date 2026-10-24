@@ -3,6 +3,7 @@ package dev.fpaddon.automine;
 import com.coderxi.plugin.fakeplayer.api.FakePlayerPlusPluginApi;
 import com.coderxi.plugin.fakeplayer.api.action.ActionController;
 import com.coderxi.plugin.fakeplayer.api.entity.FakePlayer;
+import com.destroystokyo.paper.event.server.AsyncTabCompleteEvent;
 import org.bukkit.Material;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
@@ -12,8 +13,10 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.server.ServerCommandEvent;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -25,6 +28,8 @@ import java.util.Map;
 final class CommandListener implements Listener {
 
     private static final String PREFIX = "§a[AutoMine]§r ";
+    private static final List<String> AMOUNT_EXAMPLES = List.of("-", "16", "32", "64", "128", "256", "512", "1000");
+    private static final int MAX_BLOCK_EXAMPLES = 50;
 
     private final FakePlayerPlusPluginApi api;
 
@@ -44,6 +49,77 @@ final class CommandListener implements Listener {
         if (handle(event.getSender(), event.getCommand())) {
             event.setCancelled(true);
         }
+    }
+
+    /**
+     * Gợi ý khi gõ {@code /fp action start mine <block> <số lượng> <tên bot>}, giống /give:
+     * ví dụ tên block, ví dụ số lượng và tên bot (bot của người gửi, hoặc mọi bot nếu là admin).
+     * Chỉ can thiệp đúng các vị trí tham số này; các lệnh khác giữ nguyên gợi ý gốc.
+     */
+    @EventHandler(priority = EventPriority.NORMAL)
+    public void onTabComplete(AsyncTabCompleteEvent event) {
+        if (!event.isCommand()) {
+            return;
+        }
+        String buffer = event.getBuffer();
+        String text = buffer.startsWith("/") ? buffer.substring(1) : buffer;
+        // Tách giữ phần tử rỗng ở cuối để biết đang gõ tham số nào.
+        String[] t = text.split(" ", -1);
+        if (t.length < 5) {
+            return;
+        }
+        if (!t[0].equalsIgnoreCase("fp") && !t[0].equalsIgnoreCase("fakeplayer")) {
+            return;
+        }
+        if (!t[1].equalsIgnoreCase("action") || !t[2].equalsIgnoreCase("start") || !t[3].equalsIgnoreCase("mine")) {
+            return;
+        }
+        String prefix = t[t.length - 1];
+        List<String> suggestions = switch (t.length - 1) {
+            case 4 -> blockExamples(prefix);
+            case 5 -> filterPrefix(AMOUNT_EXAMPLES, prefix);
+            case 6 -> botExamples(event.getSender(), prefix);
+            default -> null;
+        };
+        if (suggestions == null) {
+            return;
+        }
+        event.setCompletions(suggestions);
+        event.setHandled(true);
+    }
+
+    private static List<String> blockExamples(String prefix) {
+        String p = prefix.toLowerCase(Locale.ROOT).replace("minecraft:", "");
+        List<String> out = new ArrayList<>();
+        for (Material m : Material.values()) {
+            if (!m.isBlock() || m.isAir() || m.isLegacy()) {
+                continue;
+            }
+            String name = m.name().toLowerCase(Locale.ROOT);
+            if (name.startsWith(p)) {
+                out.add(name);
+                if (out.size() >= MAX_BLOCK_EXAMPLES) {
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    private List<String> botExamples(CommandSender sender, String prefix) {
+        Collection<FakePlayer> bots;
+        if (sender instanceof Player player && !player.hasPermission("fakeplayer.admin")) {
+            bots = api.getFakePlayerManager().fakeplayersByOwnerUuid(player.getUniqueId());
+        } else {
+            bots = api.getFakePlayerManager().fakeplayers();
+        }
+        List<String> names = bots.stream().map(FakePlayer::getName).sorted().toList();
+        return filterPrefix(names, prefix);
+    }
+
+    private static List<String> filterPrefix(Collection<String> items, String prefix) {
+        String p = prefix.toLowerCase(Locale.ROOT);
+        return items.stream().filter(s -> s.toLowerCase(Locale.ROOT).startsWith(p)).toList();
     }
 
     /** @return true nếu lệnh đã được addon xử lý (và cần huỷ để không chạy tiếp). */

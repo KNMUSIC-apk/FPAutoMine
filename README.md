@@ -22,18 +22,21 @@ Ví dụ:
 
 Dừng: `/fp action stop mine [tên bot]`.
 
+Gõ phím Tab sau `mine` để gợi ý: tên block (ví dụ `stone`), số lượng gợi ý (`-`, `16`, `64`, `128`...), và tên bot của bạn (mọi bot nếu bạn là admin).
+
 Quyền cần có: `fakeplayer.action` và `fakeplayer.action.mine`. Người điều khiển phải là chủ bot hoặc có `fakeplayer.admin`.
 
 ## Hành vi
 
-1. Bot tìm block cùng loại gần nhất mà nó có thể đi tới và đào. Nếu không thấy, bot đi khám phá ngẫu nhiên 16–32 block.
+1. Bot tìm block cùng loại theo thứ tự ưu tiên: lớp gần hơn trước; trong cùng một lớp đi theo trái→phải, rồi trước→sau, rồi trên→dưới. Bot chỉ đào block nào mà nó đi tới được. Nếu không thấy, bot đi khám phá ngẫu nhiên 16–32 block.
 2. Đào xong, bot nhặt đồ rơi trong bán kính 1.5 block và cập nhật số đã đào.
 3. Khi đạt chỉ tiêu, hoặc túi đầy (với chế độ không giới hạn):
-   - **Có rương trong 10 block**: bot đi tới rương, cất đồ, rồi:
+   - **Có rương trong 10 block**: bot đi tới rương (nếu rương không với tới bằng đường đi bộ, bot tự phá block chắn và đặt block lấp đất đỡ lấy từ túi), cất đồ, rồi:
      - đạt chỉ tiêu → dừng và đứng im;
      - túi đầy và không giới hạn → tiếp tục đào.
    - **Không có rương**: bot giữ đồ trong túi và đứng im.
 4. Các món sau không bị cất vào rương: thức ăn, công cụ (`_PICKAXE`, `_AXE`, `_SHOVEL`, `_HOE`, `_SWORD`), kéo, khiên, cung, nỏ, elytra.
+5. Bot được coi như NPC: quái không nhắm vào bot.
 
 Lệnh `/fp action start mine` không kèm tham số vẫn mở GUI gốc của FakePlayerPlus.
 
@@ -78,3 +81,6 @@ Addon cần FakePlayerPlus đã cài trên server. Server phải chạy Java 25,
 - `/fp action execute automine` không kiểm tra quyền `fakeplayer.action.mine` vì type này không khai báo quyền.
 - Bot chỉ nhặt đồ rơi trong bán kính 1.5 block.
 - Nếu bot bị kẹt khi đi, addon dịch chuyển bot tới điểm tiếp theo trên đường đi.
+- Phá và đặt block khi đi tới rương là tức thời (không có hoạt ảnh). Addon không kiểm tra vùng bảo vệ (claim, spawn protection), nên hãy cẩn thận khi bot làm việc gần khu vực được bảo vệ.
+- Addon không phá rương, lò, phễu và các vật chứa đồ khác khi mở đường.
+- Quái vẫn có thể gây sát thương khi đứng gần bot; addon chỉ chặn việc quái nhắm mục tiêu vào bot.

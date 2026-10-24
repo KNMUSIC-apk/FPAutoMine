@@ -25,6 +25,7 @@ public final class FPAutoMinePlugin extends JavaPlugin {
         api.getGlobalActionRegistry().register(
                 AutoMineAction.class, ACTION_NAME, "continuous", new AutoMineHandler());
         getServer().getPluginManager().registerEvents(new CommandListener(api), this);
+        getServer().getPluginManager().registerEvents(new MobListener(api), this);
         getLogger().info("Đã đăng ký action '" + ACTION_NAME + "'. Dùng: /fp action start mine <block> [số lượng|-] [tên bot]");
     }
 
