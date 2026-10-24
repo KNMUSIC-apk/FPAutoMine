@@ -1,0 +1,6 @@
+name: FPAutoMine
+version: 1.0.0
+main: dev.fpaddon.automine.FPAutoMinePlugin
+api-version: '1.21'
+depend: [FakePlayerPlus]
+description: Addon FakePlayerPlus - bot tự đi tìm và đào block, tự cất đồ vào rương gần đó.
