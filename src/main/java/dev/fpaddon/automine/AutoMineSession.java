@@ -6,6 +6,7 @@ import com.coderxi.plugin.fakeplayer.api.model.PlayerDetail;
 import com.coderxi.plugin.fakeplayer.api.nms.NMSServerPlayer;
 import com.coderxi.plugin.fakeplayer.api.nms.NMSServerPlayer.BlockBreakActionType;
 import org.bukkit.Bukkit;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
@@ -18,6 +19,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.util.RayTraceResult;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -197,6 +199,11 @@ final class AutoMineSession {
     private Plan findTarget(Player p, NMSServerPlayer nms, Pathfinder.Pos stand) {
         World world = p.getWorld();
         double reach = reach(nms);
+        // Ưu tiên tuyệt đối block đào được ngay từ chỗ đứng (đang nhìn thấy, hoặc trong tầm với).
+        Block nearby = nearbyTarget(p, reach);
+        if (nearby != null) {
+            return new Plan(nearby, List.of());
+        }
         if (candidates.isEmpty() || scanOrigin == null || scanOrigin.getWorld() != world
                 || scanOrigin.distance(p.getLocation()) > MAX_SCAN_DRIFT) {
             scan(p);
@@ -220,6 +227,67 @@ final class AutoMineSession {
             blacklist.add(key);
         }
         return null;
+    }
+
+    /**
+     * Block đào được ngay từ chỗ đứng, không cần đi: ưu tiên block bot đang nhìn thấy trước mặt,
+     * sau đó là các block trong tầm với theo thứ tự ưu tiên đào.
+     */
+    private Block nearbyTarget(Player p, double reach) {
+        World world = p.getWorld();
+        Location loc = p.getLocation();
+        Pathfinder.Pos stand = Pathfinder.feetCell(loc);
+        Location eye = p.getEyeLocation();
+
+        RayTraceResult look = world.rayTraceBlocks(eye, eye.getDirection(), reach,
+                FluidCollisionMode.NEVER, true);
+        if (look != null && look.getHitBlock() != null) {
+            Block facing = look.getHitBlock();
+            if (facing.getType() == material && !blacklist.contains(Pathfinder.posOf(facing))
+                    && Pathfinder.canMine(world, stand, facing, reach)) {
+                return facing;
+            }
+        }
+
+        int bx = loc.getBlockX();
+        int by = loc.getBlockY();
+        int bz = loc.getBlockZ();
+        int r = (int) Math.ceil(reach) + 1;
+        double maxSq = (reach + 1) * (reach + 1);
+        List<Block> near = new ArrayList<>();
+        for (int x = bx - r; x <= bx + r; x++) {
+            for (int z = bz - r; z <= bz + r; z++) {
+                if (!world.isChunkLoaded(x >> 4, z >> 4)) {
+                    continue;
+                }
+                for (int y = by - r; y <= by + r; y++) {
+                    if (y < world.getMinHeight() || y >= world.getMaxHeight()) {
+                        continue;
+                    }
+                    Block b = world.getBlockAt(x, y, z);
+                    if (b.getType() == material && !blacklist.contains(Pathfinder.posOf(b))
+                            && distanceSquared(b, loc) <= maxSq) {
+                        near.add(b);
+                    }
+                }
+            }
+        }
+        near.sort(priority(bx, by, bz));
+        for (Block b : near) {
+            if (Pathfinder.canMine(world, stand, b, reach)) {
+                return b;
+            }
+        }
+        return null;
+    }
+
+    /** Thứ tự ưu tiên đào quanh (bx, by, bz): lớp gần trước; trong lớp trái→phải, trước→sau, trên→dưới. */
+    private static Comparator<Block> priority(int bx, int by, int bz) {
+        return Comparator
+                .comparingInt((Block b) -> layer(b, bx, by, bz))
+                .thenComparingInt(b -> b.getX() - bx)
+                .thenComparingInt(b -> b.getZ() - bz)
+                .thenComparingInt(b -> by - b.getY());
     }
 
     /** Quét các block cùng loại quanh bot (chỉ chunk đã load), sắp theo thứ tự ưu tiên đào. */
@@ -248,11 +316,7 @@ final class AutoMineSession {
         }
         // Thứ tự đào: theo lớp (khoảng cách Chebyshev) tăng dần; trong cùng lớp theo
         // trái→phải (x), rồi trước→sau (z), rồi trên→dưới (y).
-        found.sort(Comparator
-                .comparingInt((Block b) -> layer(b, bx, by, bz))
-                .thenComparingInt(b -> b.getX() - bx)
-                .thenComparingInt(b -> b.getZ() - bz)
-                .thenComparingInt(b -> by - b.getY()));
+        found.sort(priority(bx, by, bz));
         candidates.addAll(found);
         scanOrigin = loc.clone();
     }
