@@ -42,10 +42,12 @@ jobs:
           gradle build --no-daemon --console=plain > build.log 2>&1
           code=$?
           cat build.log
-          # Đưa các dòng lỗi thành annotation để đọc được qua API khi log không tải được.
-          grep -E "error:|^e: |What went wrong|Could not|Execution failed|wrong version|cannot access|does not exist|FAILED|^> " build.log \
-            | head -n 20 | while IFS= read -r line; do echo "::error title=Build error::$line"; done
-          tail -n 25 build.log | while IFS= read -r line; do echo "::error title=Log tail::$line"; done
+          if [ "$code" -ne 0 ]; then
+            # Đưa các dòng lỗi thành annotation để đọc được qua API khi log không tải được.
+            grep -E "error:|^e: |What went wrong|Could not|Execution failed|wrong version|cannot access|does not exist|FAILED|^> " build.log \
+              | head -n 20 | while IFS= read -r line; do echo "::error title=Build error::$line"; done
+            tail -n 25 build.log | while IFS= read -r line; do echo "::error title=Log tail::$line"; done
+          fi
           exit $code
 
       - name: Upload jar
