@@ -51,7 +51,7 @@ Addon cần FakePlayerPlus đã cài trên server.
 
    Lệnh này tạo artifact `com.coderxi.plugin.fakeplayer:api:dev`, mà `build.gradle.kts` của addon đang dùng.
 
-2. Build addon (cần JDK 21, dùng Gradle đã cài sẵn hoặc `gradle` thay cho `./gradlew`):
+2. Build addon (cần JDK 25 để build, vì API của FakePlayerPlus được build bằng JDK 25; jar vẫn chạy trên server Java 21. Dùng Gradle 9.x hoặc `gradle` thay cho `./gradlew`):
 
    ```
    ./gradlew build
