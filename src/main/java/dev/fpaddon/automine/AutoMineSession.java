@@ -6,20 +6,23 @@ import com.coderxi.plugin.fakeplayer.api.model.PlayerDetail;
 import com.coderxi.plugin.fakeplayer.api.nms.NMSServerPlayer;
 import com.coderxi.plugin.fakeplayer.api.nms.NMSServerPlayer.BlockBreakActionType;
 import org.bukkit.Bukkit;
-import org.bukkit.FluidCollisionMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockState;
 import org.bukkit.block.Chest;
+import org.bukkit.entity.Bat;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
+import org.bukkit.entity.Monster;
+import org.bukkit.entity.Phantom;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
-import org.bukkit.util.RayTraceResult;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -28,6 +31,7 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -48,7 +52,14 @@ final class AutoMineSession {
     private static final int SEARCH_RADIUS_Y = 12;
     private static final int CHEST_RADIUS = 10;
     private static final int PICKUP_RADIUS = 6;
-    private static final int MAX_EXPLORE = 30;
+    private static final int MAX_EXPLORE = 60;
+    private static final int MOB_SWEEP_TICKS = 60;
+    private static final double MOB_SWEEP_RADIUS = 25.0;
+    /** cos của nửa góc 60°: block có hướng lệch không quá 60° so với hướng nhìn được coi là "phía trước". */
+    private static final double FRONT_COS = 0.5;
+    private static final int MAX_KNOWN_CHESTS = 16;
+    private static final int MAX_STORE_TRIES = 4;
+    private static final int MAX_BUILD_TARGETS = 2;
     private static final int MAX_WALK_TICKS = 600;
     private static final int BLOCK_COOLDOWN_TICKS = 4;
     private static final int MAX_TARGET_TRIES = 6;
@@ -61,9 +72,11 @@ final class AutoMineSession {
 
     private enum WalkKind { BLOCK, CHEST, ITEM, EXPLORE }
 
-    private enum StoreReason { FULL, QUOTA }
+    /** FULL: túi đầy giữa chừng; QUOTA: đủ chỉ tiêu; NOT_FOUND: khám phá hết lượt mà không thấy gì. */
+    private enum StoreReason { FULL, QUOTA, NOT_FOUND }
 
-    private record Plan(Block block, List<Pathfinder.Pos> path) {
+    /** {@code build}: đường được tính ở chế độ build (có thể phải phá block). */
+    private record Plan(Block block, List<Pathfinder.Pos> path, boolean build) {
     }
 
     private final Material material;
@@ -106,6 +119,11 @@ final class AutoMineSession {
     /** Rương được chỉ định cho phiên: rương gần bot lúc bắt đầu, hoặc rương đầu tiên bot dùng để cất đồ. */
     private Block homeChest;
     private boolean homeChecked;
+    /** Mọi rương đã thấy trong phiên; chunk của chúng được giữ nạp để bot còn nhớ đường khi đi xa. */
+    private final Map<Pathfinder.Pos, Block> knownChests = new LinkedHashMap<>();
+    private final Set<Long> ticketChunks = new HashSet<>();
+    /** Đếm lùi tới lần quét quái kế tiếp. */
+    private int mobSweepIn;
 
     AutoMineSession(Material material, int limit) {
         this.material = material;
@@ -120,8 +138,12 @@ final class AutoMineSession {
     void tick(FakePlayer fp, Action action) {
         Player p = fp.getPlayer();
         if (!p.isValid() || p.isDead()) {
-            finish(fp, action, "bot đã chết hoặc không còn hoạt động");
+            finish(fp, action, "bot đã chết hoặc không còn hoạt động", false);
             return;
+        }
+        if (--mobSweepIn <= 0) {
+            mobSweepIn = MOB_SWEEP_TICKS;
+            sweepMobs(p);
         }
         NMSServerPlayer nms = fp.getNms();
         if (cooldown > 0) {
@@ -142,6 +164,7 @@ final class AutoMineSession {
         NMSServerPlayer nms = fp.getNms();
         abortBreak(nms);
         halt(nms);
+        releaseTickets();
     }
 
     // ------------------------------------------------------------------ PLAN
@@ -156,6 +179,9 @@ final class AutoMineSession {
         if (!homeChecked) {
             homeChecked = true;
             List<Block> near = nearbyChests(p);
+            for (Block c : near) {
+                rememberChest(c);
+            }
             if (!near.isEmpty()) {
                 homeChest = near.get(0);
             }
@@ -195,13 +221,14 @@ final class AutoMineSession {
                 phase = Phase.MINE;
             } else {
                 startWalk(WalkKind.BLOCK, plan.block(), null, plan.path());
+                buildPath = plan.build();
             }
             return;
         }
 
         // 4. Không thấy gì quanh đây -> đi khám phá chỗ khác.
         if (explored >= MAX_EXPLORE) {
-            finish(fp, action, "không tìm thấy " + materialName() + " sau " + MAX_EXPLORE + " lần khám phá");
+            storeThenFinish(fp, action, StoreReason.NOT_FOUND);
             return;
         }
         explored++;
@@ -214,13 +241,14 @@ final class AutoMineSession {
         // Ưu tiên tuyệt đối block đào được ngay từ chỗ đứng (đang nhìn thấy, hoặc trong tầm với).
         Block nearby = nearbyTarget(p, reach);
         if (nearby != null) {
-            return new Plan(nearby, List.of());
+            return new Plan(nearby, List.of(), false);
         }
         if (candidates.isEmpty() || scanOrigin == null || scanOrigin.getWorld() != world
                 || scanOrigin.distance(p.getLocation()) > MAX_SCAN_DRIFT) {
             scan(p);
         }
         int tries = 0;
+        int builds = 0;
         while (!candidates.isEmpty() && tries < MAX_TARGET_TRIES) {
             Block b = candidates.pollFirst();
             Pathfinder.Pos key = Pathfinder.posOf(b);
@@ -229,12 +257,22 @@ final class AutoMineSession {
             }
             tries++;
             if (Pathfinder.canMine(world, stand, b, reach)) {
-                return new Plan(b, List.of());
+                return new Plan(b, List.of(), false);
             }
             Pathfinder.Result r = Pathfinder.find(world, stand,
                     cell -> Pathfinder.canMine(world, cell, b, reach), key, Pathfinder.MAX_NODES, false);
             if (r.reached() && !r.path().isEmpty()) {
-                return new Plan(b, r.path());
+                return new Plan(b, r.path(), false);
+            }
+            // Không có đường đi bộ: được phép đào xuyên block để tới nguyên liệu.
+            if (builds < MAX_BUILD_TARGETS) {
+                builds++;
+                Pathfinder.Result built = Pathfinder.findBuild(world, stand,
+                        cell -> Pathfinder.canMine(world, cell, b, reach), key, Pathfinder.MAX_BUILD_NODES,
+                        canPlaceBlocks(p), false);
+                if (built.reached() && !built.path().isEmpty()) {
+                    return new Plan(b, built.path(), true);
+                }
             }
             blacklist.add(key);
         }
@@ -242,24 +280,17 @@ final class AutoMineSession {
     }
 
     /**
-     * Block đào được ngay từ chỗ đứng, không cần đi: ưu tiên block bot đang nhìn thấy trước mặt,
-     * sau đó là các block trong tầm với theo thứ tự ưu tiên đào.
+     * Block đào được ngay từ chỗ đứng, không cần đi. Block phía trước mặt được ưu tiên trước
+     * (kể cả block dưới chân ở phía trước); sau đó là các block còn lại theo thứ tự ưu tiên đào.
      */
     private Block nearbyTarget(Player p, double reach) {
         World world = p.getWorld();
         Location loc = p.getLocation();
         Pathfinder.Pos stand = Pathfinder.feetCell(loc);
-        Location eye = p.getEyeLocation();
-
-        RayTraceResult look = world.rayTraceBlocks(eye, eye.getDirection(), reach,
-                FluidCollisionMode.NEVER, true);
-        if (look != null && look.getHitBlock() != null) {
-            Block facing = look.getHitBlock();
-            if (facing.getType() == material && !blacklist.contains(Pathfinder.posOf(facing))
-                    && Pathfinder.canMine(world, stand, facing, reach)) {
-                return facing;
-            }
-        }
+        // Hướng nhìn theo mặt phẳng ngang (công thức yaw của Minecraft).
+        double yaw = Math.toRadians(loc.getYaw());
+        double fx = -Math.sin(yaw);
+        double fz = Math.cos(yaw);
 
         int bx = loc.getBlockX();
         int by = loc.getBlockY();
@@ -284,13 +315,23 @@ final class AutoMineSession {
                 }
             }
         }
-        near.sort(priority(bx, by, bz));
+        near.sort(Comparator
+                .comparingInt((Block b) -> inFront(b, loc, fx, fz) ? 0 : 1)
+                .thenComparing(priority(bx, by, bz)));
         for (Block b : near) {
             if (Pathfinder.canMine(world, stand, b, reach)) {
                 return b;
             }
         }
         return null;
+    }
+
+    /** Block nằm trong góc 60° phía trước bot (theo mặt phẳng ngang), không tính block ngay dưới/trên chân. */
+    private static boolean inFront(Block b, Location loc, double fx, double fz) {
+        double vx = b.getX() + 0.5 - loc.getX();
+        double vz = b.getZ() + 0.5 - loc.getZ();
+        double len = Math.sqrt(vx * vx + vz * vz);
+        return len > 0.3 && (vx * fx + vz * fz) / len >= FRONT_COS;
     }
 
     /** Thứ tự ưu tiên đào quanh (bx, by, bz): lớp gần trước; trong lớp trái→phải, trước→sau, trên→dưới. */
@@ -320,8 +361,11 @@ final class AutoMineSession {
                 }
                 for (int y = minY; y <= maxY; y++) {
                     Block b = world.getBlockAt(x, y, z);
-                    if (b.getType() == material && !blacklist.contains(Pathfinder.posOf(b))) {
+                    Material t = b.getType();
+                    if (t == material && !blacklist.contains(Pathfinder.posOf(b))) {
                         found.add(b);
+                    } else if (t == Material.CHEST || t == Material.TRAPPED_CHEST) {
+                        rememberChest(b);
                     }
                 }
             }
@@ -347,10 +391,12 @@ final class AutoMineSession {
                 (int) Math.round(start.x() + Math.cos(angle) * dist),
                 start.y(),
                 (int) Math.round(start.z() + Math.sin(angle) * dist));
-        Pathfinder.Result r = Pathfinder.find(world, start, cell -> cell.equals(hint), hint,
-                Pathfinder.MAX_NODES, true);
+        // Được phép đào xuyên block để tới vùng mới; đi bộ vẫn được ưu tiên vì phá block tốn thêm chi phí.
+        Pathfinder.Result r = Pathfinder.findBuild(world, start, cell -> cell.equals(hint), hint,
+                Pathfinder.MAX_NODES, canPlaceBlocks(p), true);
         if (!r.path().isEmpty()) {
             startWalk(WalkKind.EXPLORE, null, null, r.path());
+            buildPath = true;
         }
     }
 
@@ -704,29 +750,133 @@ final class AutoMineSession {
     // ------------------------------------------------------- CẤT ĐỒ VÀO RƯƠNG
 
     /**
-     * Cất đồ rồi kết thúc. Khi đủ chỉ tiêu, bot quay về rương đã chỉ định dù đang ở xa;
-     * không tới được thì dùng rương gần nhất trong {@link #CHEST_RADIUS} block. Không có rương nào
-     * tới được thì đồ còn lại trong túi.
+     * Cất đồ rồi kết thúc. Khi kết thúc nhiệm vụ (đủ chỉ tiêu, hoặc khám phá hết mà không thấy gì),
+     * bot về rương đã chỉ định dù đang ở xa, cất toàn bộ đồ, rồi biến mất nếu đã cất hết.
+     * Khi túi đầy giữa chừng, chỉ dùng rương trong {@link #CHEST_RADIUS} block.
      */
     private void storeThenFinish(FakePlayer fp, Action action, StoreReason reason) {
         Player p = fp.getPlayer();
+        World world = p.getWorld();
         Pathfinder.Pos stand = Pathfinder.feetCell(p.getLocation());
-        if (reason == StoreReason.QUOTA && homeChest != null && isChest(homeChest)
-                && homeChest.getWorld() == p.getWorld() && !fullChests.contains(Pathfinder.posOf(homeChest))) {
+        boolean ending = reason != StoreReason.FULL;
+        if (ending && bagEmpty(p)) {
+            finish(fp, action, endReason(reason) + ", không còn đồ để cất", true);
+            return;
+        }
+        int tries = 0;
+        if (ending && homeChest != null && usableChest(world, homeChest)) {
+            tries++;
             if (startStoreWalk(p, stand, homeChest, reason)) {
                 return;
             }
         }
-        for (Block chest : nearbyChests(p)) {
-            if (!fullChests.contains(Pathfinder.posOf(chest)) && startStoreWalk(p, stand, chest, reason)) {
+        for (Block chest : storeCandidates(p, ending)) {
+            if (tries++ >= MAX_STORE_TRIES) {
+                break;
+            }
+            if (startStoreWalk(p, stand, chest, reason)) {
                 return;
             }
         }
         pendingStore = null;
-        String why = reason == StoreReason.QUOTA
-                ? "đủ " + limit + " block, không tới được rương nên đồ còn trong túi"
+        String why = ending
+                ? endReason(reason) + ", không tới được rương nên bot giữ đồ trong túi"
                 : "túi đầy và không có rương trong " + CHEST_RADIUS + " block";
-        finish(fp, action, why);
+        finish(fp, action, why, false);
+    }
+
+    /** Rương có thể dùng để cất đồ: chunk đang nạp, vẫn là rương, và chưa bị đánh dấu đầy/không tới được. */
+    private boolean usableChest(World world, Block b) {
+        if (b.getWorld() != world || !world.isChunkLoaded(b.getX() >> 4, b.getZ() >> 4)) {
+            return false;
+        }
+        return isChest(b) && !fullChests.contains(Pathfinder.posOf(b));
+    }
+
+    /**
+     * Các rương ứng viên để cất đồ, gần bot trước. Khi kết thúc nhiệm vụ thì cộng thêm mọi rương đã nhớ
+     * trong phiên, kể cả ở xa.
+     */
+    private List<Block> storeCandidates(Player p, boolean ending) {
+        World world = p.getWorld();
+        Location loc = p.getLocation();
+        Map<Pathfinder.Pos, Block> byPos = new LinkedHashMap<>();
+        if (ending) {
+            for (Block c : knownChests.values()) {
+                if (usableChest(world, c)) {
+                    byPos.putIfAbsent(Pathfinder.posOf(c), c);
+                }
+            }
+        }
+        for (Block c : nearbyChests(p)) {
+            if (usableChest(world, c)) {
+                byPos.putIfAbsent(Pathfinder.posOf(c), c);
+            }
+        }
+        List<Block> out = new ArrayList<>(byPos.values());
+        out.sort(Comparator.comparingDouble(b -> distanceSquared(b, loc)));
+        return out;
+    }
+
+    /** Nhớ một rương trong phiên và nạp chunk của nó (ticket của plugin) để bot còn tới được khi đi xa. */
+    private void rememberChest(Block b) {
+        Pathfinder.Pos key = Pathfinder.posOf(b);
+        if (knownChests.containsKey(key) || knownChests.size() >= MAX_KNOWN_CHESTS) {
+            return;
+        }
+        knownChests.put(key, b);
+        int cx = b.getX() >> 4;
+        int cz = b.getZ() >> 4;
+        long chunkKey = ((long) cx << 32) ^ (cz & 0xffffffffL);
+        if (ticketChunks.add(chunkKey)) {
+            b.getWorld().addPluginChunkTicket(cx, cz, plugin());
+        }
+    }
+
+    /** Trả lại mọi ticket chunk đã giữ cho các rương của phiên. */
+    private void releaseTickets() {
+        if (knownChests.isEmpty() && ticketChunks.isEmpty()) {
+            return;
+        }
+        Plugin plugin = plugin();
+        for (Block b : knownChests.values()) {
+            b.getWorld().removePluginChunkTicket(b.getX() >> 4, b.getZ() >> 4, plugin);
+        }
+        knownChests.clear();
+        ticketChunks.clear();
+        homeChest = null;
+    }
+
+    private String endReason(StoreReason reason) {
+        return reason == StoreReason.QUOTA
+                ? "đủ " + limit + " block"
+                : "không tìm thấy " + materialName() + " sau " + MAX_EXPLORE + " lần khám phá";
+    }
+
+    private static Plugin plugin() {
+        return JavaPlugin.getProvidingPlugin(AutoMineSession.class);
+    }
+
+    /**
+     * Xoá quái (và dơi) trong bán kính {@link #MOB_SWEEP_RADIUS} quanh bot. Bỏ qua mob đang ngồi
+     * thuyền/xe hoặc đang chở mob khác.
+     */
+    private static void sweepMobs(Player p) {
+        Location loc = p.getLocation();
+        double r = MOB_SWEEP_RADIUS;
+        double maxSq = r * r;
+        for (Entity e : p.getWorld().getNearbyEntities(loc, r, r, r)) {
+            if (!(e instanceof Monster || e instanceof Bat || e instanceof Phantom)) {
+                continue;
+            }
+            if (e.isInsideVehicle() || !e.getPassengers().isEmpty()) {
+                continue;
+            }
+            if (e.getLocation().distanceSquared(loc) > maxSq) {
+                continue;
+            }
+            e.remove();
+        }
     }
 
     /**
@@ -761,6 +911,7 @@ final class AutoMineSession {
 
     /** Rương đầu tiên bot dùng để cất đồ trở thành rương đã chỉ định (nếu lúc bắt đầu chưa có). */
     private void rememberHome(Block chest) {
+        rememberChest(chest);
         if (homeChest == null) {
             homeChest = chest;
         }
@@ -809,7 +960,7 @@ final class AutoMineSession {
         int moved = 0;
         BlockState state = chestBlock.getState();
         if (state instanceof Chest chest) {
-            moved = transferToChest(p, chest.getInventory(), reason == StoreReason.QUOTA);
+            moved = transferToChest(p, chest.getInventory(), reason != StoreReason.FULL);
         }
         if (moved == 0) {
             fullChests.add(Pathfinder.posOf(chestBlock));
@@ -817,11 +968,14 @@ final class AutoMineSession {
             skippedItems.clear();
         }
 
-        if (reason == StoreReason.QUOTA) {
-            String result = bagEmpty(p) ? "đã cất toàn bộ đồ vào rương"
-                    : moved > 0 ? "đã cất một phần đồ vào rương, phần còn lại không vừa"
-                    : "rương đầy nên đồ còn trong túi";
-            finish(fp, action, "đủ " + limit + " block, " + result);
+        if (reason != StoreReason.FULL) {
+            if (bagEmpty(p)) {
+                finish(fp, action, endReason(reason) + ", đã cất toàn bộ đồ vào rương", true);
+            } else {
+                finish(fp, action, endReason(reason) + (moved > 0
+                        ? ", phần đồ còn lại không vừa rương nên bot giữ lại"
+                        : ", rương đầy nên bot giữ đồ"), false);
+            }
             return;
         }
         phase = Phase.PLAN;
@@ -882,11 +1036,17 @@ final class AutoMineSession {
 
     // ------------------------------------------------------------ KẾT THÚC
 
-    private void finish(FakePlayer fp, Action action, String reason) {
+    /**
+     * Kết thúc phiên. Nếu {@code despawn} thì xoá bot (sau tick hiện tại), giống {@code /fp remove}.
+     */
+    private void finish(FakePlayer fp, Action action, String reason, boolean despawn) {
         abort(fp);
         notifyOwners(fp, "§a[AutoMine]§r " + fp.getName() + ": dừng đào " + materialName()
                 + " (" + reason + "). Đã đào " + mined + " block.");
         fp.getActions().stop(action);
+        if (despawn) {
+            Bukkit.getScheduler().runTask(plugin(), () -> fp.quit("AutoMine: đã xong nhiệm vụ"));
+        }
     }
 
     static void notifyOwners(FakePlayer fp, String message) {

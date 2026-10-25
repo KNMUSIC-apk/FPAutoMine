@@ -64,7 +64,7 @@ final class CommandListener implements Listener {
         String buffer = event.getBuffer();
         String text = buffer.startsWith("/") ? buffer.substring(1) : buffer;
         // Tách giữ phần tử rỗng ở cuối để biết đang gõ tham số nào.
-        String[] t = text.split(" ", -1);
+        String[] t = normalize(text.split(" ", -1));
         if (t.length < 5) {
             return;
         }
@@ -86,6 +86,23 @@ final class CommandListener implements Listener {
         }
         event.setCompletions(suggestions);
         event.setHandled(true);
+    }
+
+    /**
+     * Quy {@code /fpautomine start|stop ...} về {@code /fp action start|stop mine ...} để xử lý chung.
+     * Các token khác giữ nguyên.
+     */
+    private static String[] normalize(String[] t) {
+        if (t.length < 2 || !t[0].equalsIgnoreCase("fpautomine")) {
+            return t;
+        }
+        String[] out = new String[t.length + 2];
+        out[0] = "fp";
+        out[1] = "action";
+        out[2] = t[1];
+        out[3] = "mine";
+        System.arraycopy(t, 2, out, 4, t.length - 2);
+        return out;
     }
 
     private static List<String> blockExamples(String prefix) {
@@ -128,7 +145,7 @@ final class CommandListener implements Listener {
             return false;
         }
         String text = raw.startsWith("/") ? raw.substring(1) : raw;
-        String[] t = text.trim().split("\\s+");
+        String[] t = normalize(text.trim().split("\\s+"));
         if (t.length < 4) {
             return false;
         }

@@ -31,6 +31,8 @@ final class Pathfinder {
     static final int MAX_NODES = 6000;
     static final int MAX_BUILD_NODES = 12000;
     static final int MAX_RADIUS = 48;
+    /** Giới hạn số ô duyệt khi đích ở xa (tăng theo khoảng cách, không vượt quá). */
+    static final int MAX_BUDGET = 60000;
     static final int MAX_DY = 16;
     /** Chiều cao mắt của người chơi (block). */
     static final double EYE_HEIGHT = 1.62;
@@ -102,13 +104,30 @@ final class Pathfinder {
      * Dùng khi đường đi bộ thường không tới được đích.
      */
     static Result findBuild(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean canPlace) {
-        return search(world, start, goal, hint, maxNodes, false, true, canPlace);
+        return findBuild(world, start, goal, hint, maxNodes, canPlace, false);
+    }
+
+    /** Như {@link #findBuild(World, Pos, Goal, Pos, int, boolean)}; {@code bestEffort} trả về đường tới ô gần đích nhất. */
+    static Result findBuild(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean canPlace,
+                            boolean bestEffort) {
+        return search(world, start, goal, hint, maxNodes, bestEffort, true, canPlace);
     }
 
     private static Result search(World world, Pos start, Goal goal, Pos hint, int maxNodes,
                                  boolean bestEffort, boolean build, boolean canPlace) {
         if (goal.test(start)) {
             return new Result(Collections.emptyList(), true);
+        }
+        // Đích ở xa (có hint): mở rộng vùng tìm và ngân sách ô theo khoảng cách.
+        int radX = MAX_RADIUS;
+        int radY = MAX_DY;
+        if (hint != null) {
+            int hx = Math.abs(hint.x() - start.x());
+            int hz = Math.abs(hint.z() - start.z());
+            int hy = Math.abs(hint.y() - start.y());
+            radX = Math.max(MAX_RADIUS, Math.max(hx, hz) + 16);
+            radY = Math.max(MAX_DY, hy + 8);
+            maxNodes = Math.max(maxNodes, Math.min(MAX_BUDGET, (hx + hy + hz) * 150));
         }
         PriorityQueue<Node> open = new PriorityQueue<>((a, b) -> Double.compare(a.f(), b.f()));
         Map<Pos, Double> bestG = new HashMap<>();
@@ -134,9 +153,9 @@ final class Pathfinder {
             for (int i = 0; i < 4; i++) {
                 for (int step = -1; step <= 1; step++) {
                     Pos next = cur.pos().offset(DX[i], step, DZ[i]);
-                    if (Math.abs(next.x() - start.x()) > MAX_RADIUS
-                            || Math.abs(next.z() - start.z()) > MAX_RADIUS
-                            || Math.abs(next.y() - start.y()) > MAX_DY) {
+                    if (Math.abs(next.x() - start.x()) > radX
+                            || Math.abs(next.z() - start.z()) > radX
+                            || Math.abs(next.y() - start.y()) > radY) {
                         continue;
                     }
                     double extra = 0.0;
