@@ -121,45 +121,126 @@ final class Pathfinder {
         return search(world, start, goal, hint, maxNodes, bestEffort, true, canPlace, false);
     }
 
+    /** Đọc hết một lần tìm đường trong một lượt (khi cần kết quả ngay: thoát hiểm, cất đồ). */
     private static Result search(World world, Pos start, Goal goal, Pos hint, int maxNodes,
                                  boolean bestEffort, boolean build, boolean canPlace, boolean escape) {
-        if (goal.test(start)) {
-            return new Result(Collections.emptyList(), true);
+        Search s = new Search(world, start, goal, hint, maxNodes, bestEffort, build, canPlace, escape);
+        while (!s.done()) {
+            s.step(Integer.MAX_VALUE);
         }
-        // Đích ở xa (có hint): mở rộng vùng tìm và ngân sách ô theo khoảng cách.
-        int radX = MAX_RADIUS;
-        int radY = MAX_DY;
-        if (hint != null) {
-            int hx = Math.abs(hint.x() - start.x());
-            int hz = Math.abs(hint.z() - start.z());
-            int hy = Math.abs(hint.y() - start.y());
-            radX = Math.max(MAX_RADIUS, Math.max(hx, hz) + 16);
-            radY = Math.max(MAX_DY, hy + 8);
-            maxNodes = Math.max(maxNodes, Math.min(MAX_BUDGET, (hx + hy + hz) * 150));
-        }
-        PriorityQueue<Node> open = new PriorityQueue<>((a, b) -> Double.compare(a.f(), b.f()));
-        Map<Pos, Double> bestG = new HashMap<>();
-        // Chi phí bước vào một ô không đổi trong một lần tìm: nhớ lại để khỏi tính lặp.
-        Map<Pos, Double> enterMemo = new HashMap<>();
-        Set<Pos> closed = new HashSet<>();
-        Node startNode = new Node(start, null, 0.0, heuristic(start, hint));
-        open.add(startNode);
-        bestG.put(start, 0.0);
-        Node closest = startNode;
-        int expanded = 0;
+        return s.result();
+    }
 
-        while (!open.isEmpty() && expanded < maxNodes) {
-            Node cur = open.poll();
-            if (!closed.add(cur.pos())) {
-                continue;
+    /**
+     * Một lần tìm đường có thể tạm dừng. Mỗi lần {@link #step} chỉ mở rộng một số nút được cấp,
+     * nên việc tìm đường trải qua nhiều tick thay vì chặn server trong một tick.
+     */
+    static final class Search {
+        private final World world;
+        private final Pos start;
+        private final Goal goal;
+        private final Pos hint;
+        private final boolean bestEffort;
+        private final boolean build;
+        private final boolean canPlace;
+        private final boolean escape;
+        private final int radX;
+        private final int radY;
+        private final int maxNodes;
+        private final PriorityQueue<Node> open = new PriorityQueue<>((a, b) -> Double.compare(a.f(), b.f()));
+        private final Map<Pos, Double> bestG = new HashMap<>();
+        /** Chi phí bước vào một ô không đổi trong một lần tìm: nhớ lại để khỏi tính lặp. */
+        private final Map<Pos, Double> enterMemo = new HashMap<>();
+        private final Set<Pos> closed = new HashSet<>();
+        private final Node startNode;
+        private Node closest;
+        private int expanded;
+        private Result result;
+
+        Search(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean bestEffort,
+               boolean build, boolean canPlace, boolean escape) {
+            this.world = world;
+            this.start = start;
+            this.goal = goal;
+            this.hint = hint;
+            this.bestEffort = bestEffort;
+            this.build = build;
+            this.canPlace = canPlace;
+            this.escape = escape;
+            // Đích ở xa (có hint): mở rộng vùng tìm và ngân sách ô theo khoảng cách.
+            int rx = MAX_RADIUS;
+            int ry = MAX_DY;
+            int budget = maxNodes;
+            if (hint != null) {
+                int hx = Math.abs(hint.x() - start.x());
+                int hz = Math.abs(hint.z() - start.z());
+                int hy = Math.abs(hint.y() - start.y());
+                rx = Math.max(MAX_RADIUS, Math.max(hx, hz) + 16);
+                ry = Math.max(MAX_DY, hy + 8);
+                budget = Math.max(maxNodes, Math.min(MAX_BUDGET, (hx + hy + hz) * 150));
             }
-            expanded++;
-            if (goal.test(cur.pos())) {
-                return new Result(buildPath(cur), true);
+            this.radX = rx;
+            this.radY = ry;
+            this.maxNodes = budget;
+            this.startNode = new Node(start, null, 0.0, heuristic(start, hint));
+            this.closest = startNode;
+            if (goal.test(start)) {
+                this.result = new Result(Collections.emptyList(), true);
+                return;
             }
-            if (heuristic(cur.pos(), hint) < heuristic(closest.pos(), hint)) {
-                closest = cur;
+            open.add(startNode);
+            bestG.put(start, 0.0);
+        }
+
+        boolean done() {
+            return result != null;
+        }
+
+        Result result() {
+            return result;
+        }
+
+        /**
+         * Mở rộng tối đa {@code budget} nút rồi dừng. Trả về số nút đã mở rộng trong lượt này.
+         * Gọi lại ở tick sau để tiếp tục, cho tới khi {@link #done()}.
+         */
+        int step(int budget) {
+            if (result != null) {
+                return 0;
             }
+            int spent = 0;
+            while (spent < budget) {
+                if (open.isEmpty() || expanded >= maxNodes) {
+                    finish();
+                    return spent;
+                }
+                Node cur = open.poll();
+                if (!closed.add(cur.pos())) {
+                    continue;
+                }
+                expanded++;
+                spent++;
+                if (goal.test(cur.pos())) {
+                    result = new Result(buildPath(cur), true);
+                    return spent;
+                }
+                if (heuristic(cur.pos(), hint) < heuristic(closest.pos(), hint)) {
+                    closest = cur;
+                }
+                expandNeighbours(cur);
+            }
+            return spent;
+        }
+
+        private void finish() {
+            if (bestEffort && closest != startNode) {
+                result = new Result(buildPath(closest), false);
+            } else {
+                result = new Result(Collections.emptyList(), false);
+            }
+        }
+
+        private void expandNeighbours(Node cur) {
             for (int i = 0; i < 4; i++) {
                 for (int step = -1; step <= 1; step++) {
                     Pos next = cur.pos().offset(DX[i], step, DZ[i]);
@@ -195,10 +276,6 @@ final class Pathfinder {
                 }
             }
         }
-        if (bestEffort && closest != startNode) {
-            return new Result(buildPath(closest), false);
-        }
-        return new Result(Collections.emptyList(), false);
     }
 
     private static double heuristic(Pos p, Pos hint) {

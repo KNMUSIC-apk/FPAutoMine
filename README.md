@@ -92,8 +92,19 @@ Giới hạn: lộ trình chỉ dựa vào trạng thái block hiện có. Addon
 | `AutoMineSession` | Máy trạng thái: lập kế hoạch → đi → đào → xác nhận → cất đồ |
 | `Pathfinder` | Tìm đường A* trên lưới block, có chế độ khám phá và thoát hiểm |
 | `Safety` | Quy tắc an toàn: void, ngạt, chất lỏng/lửa, block rơi, rơi cao |
+| `Throttle` | Ngân sách công việc nặng mỗi tick server, dùng chung cho mọi bot, tự giảm khi server chậm |
 | `CommandListener` | Chặn lệnh `/fp action start mine ...` và khởi chạy action |
 | `FPAutoMinePlugin` | Điểm vào của plugin, đăng ký action và listener |
+
+## Hiệu năng
+
+Việc nặng nhất (tìm đường A*, quét block quanh bot) không chạy trong một tick nữa mà được chia nhỏ qua nhiều tick:
+
+- Tổng công việc tìm đường và quét của **mọi bot** bị giới hạn mỗi tick server (lớp `Throttle`). Khi thời gian mỗi tick tăng (server đang chậm), giới hạn này tự giảm.
+- Mỗi bot chỉ mở rộng tối đa 400 nút A* và quét tối đa 3000 ô mỗi tick; toàn bộ server dùng chung khoảng 375 nút A* hoặc 6000 ô mỗi tick.
+- Hệ quả: bot có thể đứng chờ vài tick (vài phần mười giây) trước khi bắt đầu đi tới block mới, nhất là khi có nhiều bot cùng chạy.
+- Các mob-sweep của các bot được lệch ngẫu nhiên, không quét cùng tick.
+- Việc cất đồ (tìm đường tới rương) và thoát hiểm vẫn chạy đồng bộ trong một tick, vì cần kết quả ngay.
 
 ## Hạn chế và trạng thái kiểm thử
 
