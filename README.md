@@ -70,6 +70,19 @@ Addon cần FakePlayerPlus đã cài trên server. Server phải chạy Java 25,
 
 3. Lấy file `build/libs/FPAutoMine-1.0.0.jar`, đặt vào thư mục `plugins/` của server và khởi động lại.
 
+## An toàn
+
+Bot kiểm tra an toàn cho từng nước đi và từng lần đào (lớp `Safety`):
+
+- **Rơi vào void:** bot không đứng sát đáy thế giới (cách đáy dưới 4 block). Không đào block ngay dưới chân nếu bot sẽ rơi quá 3 block, hoặc rơi vào chất lỏng hay void.
+- **Ngạt do block:** bot không đi vào ô có block đặc ở đầu hoặc chân. Nếu lỡ bị kẹt trong block, bot phá block đó trước.
+- **Dung nham, lửa, nước, magma:** bot không đi vào và không đứng trên các loại này. Lộ trình tránh sát dung nham và lửa (phạt rất nặng), và tránh nước (phạt nhẹ). Bot không đào block kề chất lỏng, vì chất lỏng sẽ chảy vào chỗ trống. Nếu lỡ ở trong chất lỏng hoặc lửa, bot thoát ngay theo đường thoát hiểm, được phép đi qua chất lỏng để ra ngoài.
+- **Block rơi (cát, sỏi):** không đào block có cát/sỏi nằm trên đầu khi bot đứng cùng cột, vì block rơi sẽ đè lên bot.
+- **Đói:** dưới 14 điểm đói, bot tự ăn một món trong túi. Bot không ăn thịt gà sống, thịt thối, mắt nhện, khoai tây độc, cá nóc, và chorus fruit (chorus làm bot dịch chuyển ngẫu nhiên, có thể vào dung nham hoặc void). Đói nguy kịch mà không còn đồ ăn thì bot dừng và báo chủ.
+- **Kiểm tra từng bước:** trước mỗi bước đi, bot kiểm tra lại ô kế tiếp. Trong lúc đào, bot kiểm tra lại block đang đào. Nếu thế giới đã đổi (chất lỏng chảy, block rơi), bot tính lại đường thay vì bước vào.
+
+Giới hạn: lộ trình chỉ dựa vào trạng thái block hiện có. Addon không mô phỏng hướng chảy của chất lỏng theo thời gian, không xử lý khi bot đang cháy (fire tick), và không hồi máu.
+
 ## Cấu trúc mã nguồn
 
 | File | Vai trò |
@@ -77,7 +90,8 @@ Addon cần FakePlayerPlus đã cài trên server. Server phải chạy Java 25,
 | `AutoMineAction` | Định nghĩa action `automine` |
 | `AutoMineHandler` | Nhận tick từ FakePlayerPlus, giữ phiên của từng bot theo UUID |
 | `AutoMineSession` | Máy trạng thái: lập kế hoạch → đi → đào → xác nhận → cất đồ |
-| `Pathfinder` | Tìm đường A* trên lưới block, có chế độ khám phá |
+| `Pathfinder` | Tìm đường A* trên lưới block, có chế độ khám phá và thoát hiểm |
+| `Safety` | Quy tắc an toàn: void, ngạt, chất lỏng/lửa, block rơi, rơi cao |
 | `CommandListener` | Chặn lệnh `/fp action start mine ...` và khởi chạy action |
 | `FPAutoMinePlugin` | Điểm vào của plugin, đăng ký action và listener |
 

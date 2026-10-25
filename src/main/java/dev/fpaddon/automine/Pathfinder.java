@@ -45,7 +45,7 @@ final class Pathfinder {
     private static final int[] DZ = {0, 0, 1, -1};
 
     /** Block nguy hiểm: không đứng trong/trên/cạnh chúng. */
-    private static final Set<Material> HAZARDS = EnumSet.of(
+    static final Set<Material> HAZARDS = EnumSet.of(
             Material.WATER, Material.LAVA, Material.FIRE, Material.SOUL_FIRE,
             Material.CACTUS, Material.MAGMA_BLOCK, Material.SWEET_BERRY_BUSH,
             Material.POWDER_SNOW, Material.BUBBLE_COLUMN, Material.CAMPFIRE,
@@ -96,7 +96,15 @@ final class Pathfinder {
      * @param bestEffort   nếu không tới được đích, trả về đường tới ô gần {@code hint} nhất
      */
     static Result find(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean bestEffort) {
-        return search(world, start, goal, hint, maxNodes, bestEffort, false, false);
+        return search(world, start, goal, hint, maxNodes, bestEffort, false, false, false);
+    }
+
+    /**
+     * Đường thoát hiểm khi bot đang trong chất lỏng/lửa hoặc bị block đặc bóp: được phép đi qua
+     * chất lỏng và đứng tạm trên chất lỏng, đích là ô đứng an toàn ({@link #walkable}).
+     */
+    static Result findEscape(World world, Pos start, Goal goal, int maxNodes, boolean canPlace) {
+        return search(world, start, goal, null, maxNodes, false, true, canPlace, true);
     }
 
     /**
@@ -110,11 +118,11 @@ final class Pathfinder {
     /** Như {@link #findBuild(World, Pos, Goal, Pos, int, boolean)}; {@code bestEffort} trả về đường tới ô gần đích nhất. */
     static Result findBuild(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean canPlace,
                             boolean bestEffort) {
-        return search(world, start, goal, hint, maxNodes, bestEffort, true, canPlace);
+        return search(world, start, goal, hint, maxNodes, bestEffort, true, canPlace, false);
     }
 
     private static Result search(World world, Pos start, Goal goal, Pos hint, int maxNodes,
-                                 boolean bestEffort, boolean build, boolean canPlace) {
+                                 boolean bestEffort, boolean build, boolean canPlace, boolean escape) {
         if (goal.test(start)) {
             return new Result(Collections.emptyList(), true);
         }
@@ -131,6 +139,8 @@ final class Pathfinder {
         }
         PriorityQueue<Node> open = new PriorityQueue<>((a, b) -> Double.compare(a.f(), b.f()));
         Map<Pos, Double> bestG = new HashMap<>();
+        // Chi phí bước vào một ô không đổi trong một lần tìm: nhớ lại để khỏi tính lặp.
+        Map<Pos, Double> enterMemo = new HashMap<>();
         Set<Pos> closed = new HashSet<>();
         Node startNode = new Node(start, null, 0.0, heuristic(start, hint));
         open.add(startNode);
@@ -160,7 +170,7 @@ final class Pathfinder {
                     }
                     double extra = 0.0;
                     // Bước lên 1 block cần chỗ trống ở trên đầu vị trí hiện tại.
-                    if (step == 1 && !passable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z())) {
+                    if (step == 1 && !passable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z(), escape)) {
                         if (!build || !clearable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z())) {
                             continue;
                         }
@@ -169,7 +179,8 @@ final class Pathfinder {
                     if (closed.contains(next)) {
                         continue;
                     }
-                    double enter = enterCost(world, next, build, canPlace);
+                    double enter = enterMemo.computeIfAbsent(next,
+                            q -> enterCost(world, q, build, canPlace, escape));
                     if (enter < 0) {
                         continue;
                     }
@@ -211,11 +222,16 @@ final class Pathfinder {
     }
 
     static boolean passable(World world, int x, int y, int z) {
+        return passable(world, x, y, z, false);
+    }
+
+    /** Ô bot có thể chiếm (không phải block đặc). Khi thoát hiểm thì chất lỏng/lửa cũng được coi là chiếm được. */
+    static boolean passable(World world, int x, int y, int z, boolean escape) {
         if (!inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
             return false;
         }
         Block b = world.getBlockAt(x, y, z);
-        return b.isPassable() && !HAZARDS.contains(b.getType());
+        return b.isPassable() && (escape || !HAZARDS.contains(b.getType()));
     }
 
     static boolean supports(World world, int x, int y, int z) {
@@ -235,6 +251,16 @@ final class Pathfinder {
             return false;
         }
         Material m = world.getBlockAt(x, y, z).getType();
+        return m.isSolid() && !HAZARDS.contains(m) && !UNBREAKABLE.contains(m) && !protectedBlock(m)
+                && !Safety.fluidAdjacent(world, x, y, z);
+    }
+
+    /**
+     * Có thể phá block này ngay để thoát ngạt: là block đặc, không bất khả phá, không phải vật chứa.
+     * Không xét chất lỏng kề vì khi ngạt thì phải phá trước đã.
+     */
+    static boolean breakableNow(Block b) {
+        Material m = b.getType();
         return m.isSolid() && !HAZARDS.contains(m) && !UNBREAKABLE.contains(m) && !protectedBlock(m);
     }
 
@@ -252,31 +278,53 @@ final class Pathfinder {
      * Chi phí để bot đứng vào ô {@code p} (chân và đầu thoáng, có đất đỡ).
      * Trả về -1 nếu không đi được; ở chế độ build, phần bị chắn/hổng được tính thêm chi phí.
      */
-    private static double enterCost(World world, Pos p, boolean build, boolean canPlace) {
+    private static double enterCost(World world, Pos p, boolean build, boolean canPlace, boolean escape) {
+        // Sát đáy thế giới: có thể rơi vào void, không đứng ở đó.
+        if (p.y() < world.getMinHeight() + Safety.VOID_MARGIN) {
+            return -1;
+        }
         double cost = 0.0;
-        if (!passable(world, p.x(), p.y(), p.z())) {
+        if (!passable(world, p.x(), p.y(), p.z(), escape)) {
             if (!build || !clearable(world, p.x(), p.y(), p.z())) {
                 return -1;
             }
             cost += CLEAR_COST;
         }
-        if (!passable(world, p.x(), p.y() + 1, p.z())) {
+        if (!passable(world, p.x(), p.y() + 1, p.z(), escape)) {
             if (!build || !clearable(world, p.x(), p.y() + 1, p.z())) {
                 return -1;
             }
             cost += CLEAR_COST;
         }
-        if (!supports(world, p.x(), p.y() - 1, p.z())) {
+        if (!ground(world, p.x(), p.y() - 1, p.z(), escape)) {
             if (!build || !canPlace || !passable(world, p.x(), p.y() - 1, p.z())) {
                 return -1;
             }
             cost += PLACE_COST;
         }
-        return cost;
+        // Phạt theo nguy hiểm kề bên (dung nham, lửa, nước, block rơi) để lộ trình tránh xa chúng.
+        return cost + Safety.hazardCost(world, p.x(), p.y(), p.z());
+    }
+
+    /** Có đất đỡ ở ô (x, y, z). Khi thoát hiểm, chất lỏng/block nóng cũng tạm coi là đỡ được. */
+    private static boolean ground(World world, int x, int y, int z, boolean escape) {
+        if (supports(world, x, y, z)) {
+            return true;
+        }
+        if (!escape || !inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+            return false;
+        }
+        Material m = world.getBlockAt(x, y, z).getType();
+        return m.isSolid() || HAZARDS.contains(m);
     }
 
     static boolean walkable(World world, Pos p) {
-        return enterCost(world, p, false, false) >= 0;
+        return enterCost(world, p, false, false, false) >= 0;
+    }
+
+    /** Ô đứng hợp lệ ngay lúc này, dùng để kiểm tra lại ô kế tiếp trước khi bước (thế giới có thể đã đổi). */
+    static boolean enterable(World world, Pos p, boolean build, boolean canPlace, boolean escape) {
+        return enterCost(world, p, build, canPlace, escape) >= 0;
     }
 
     /**
@@ -292,6 +340,9 @@ final class Pathfinder {
         double dz = target.getZ() + 0.5 - ez;
         double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
         if (dist > reach) {
+            return false;
+        }
+        if (!Safety.breakSafe(world, stand, target)) {
             return false;
         }
         if (!target.getType().isSolid()) {

@@ -21,6 +21,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -60,6 +61,14 @@ final class AutoMineSession {
     private static final int MAX_KNOWN_CHESTS = 16;
     private static final int MAX_STORE_TRIES = 4;
     private static final int MAX_BUILD_TARGETS = 2;
+    private static final int ESCAPE_NODES = 3000;
+    /** Đói dưới mức này thì tự ăn; dưới mức nguy kịch mà không có đồ ăn thì dừng. */
+    private static final int FOOD_LOW = 14;
+    private static final int FOOD_CRITICAL = 6;
+    /** Món ăn có hại hoặc gây dịch chuyển (chorus fruit đưa bot đi ngẫu nhiên, có thể vào dung nham/void). */
+    private static final Set<Material> NEVER_EAT = Set.of(
+            Material.ROTTEN_FLESH, Material.SPIDER_EYE, Material.POISONOUS_POTATO,
+            Material.PUFFERFISH, Material.CHICKEN, Material.CHORUS_FRUIT);
     private static final int MAX_WALK_TICKS = 600;
     private static final int BLOCK_COOLDOWN_TICKS = 4;
     private static final int MAX_TARGET_TRIES = 6;
@@ -70,7 +79,7 @@ final class AutoMineSession {
 
     private enum Phase { PLAN, WALK, MINE, VERIFY }
 
-    private enum WalkKind { BLOCK, CHEST, ITEM, EXPLORE }
+    private enum WalkKind { BLOCK, CHEST, ITEM, EXPLORE, ESCAPE }
 
     /** FULL: túi đầy giữa chừng; QUOTA: đủ chỉ tiêu; NOT_FOUND: khám phá hết lượt mà không thấy gì. */
     private enum StoreReason { FULL, QUOTA, NOT_FOUND }
@@ -100,6 +109,8 @@ final class AutoMineSession {
     private StoreReason pendingStore;
     /** Đường hiện tại được tính ở chế độ build: có thể phải phá hoặc đặt block khi đi. */
     private boolean buildPath;
+    /** Đang trên đường thoát hiểm (chất lỏng/lửa/ngạt): ưu tiên hơn mọi việc khác. */
+    private boolean escaping;
 
     // --- đào ---
     private Block target;
@@ -146,6 +157,18 @@ final class AutoMineSession {
             sweepMobs(p);
         }
         NMSServerPlayer nms = fp.getNms();
+        // Nguy hiểm trước hết: thoát ra ngay, không làm việc khác.
+        if (!escaping && Safety.inDanger(p.getWorld(), p.getLocation())) {
+            escape(fp, action);
+            return;
+        }
+        if (!escaping && p.getFoodLevel() <= FOOD_LOW && eatFood(p)) {
+            return;
+        }
+        if (!escaping && p.getFoodLevel() <= FOOD_CRITICAL && foodSlot(p.getInventory()) < 0) {
+            finish(fp, action, "đói và không còn đồ ăn trong túi", false);
+            return;
+        }
         if (cooldown > 0) {
             cooldown--;
             halt(nms);
@@ -440,6 +463,11 @@ final class AutoMineSession {
         }
 
         Pathfinder.Pos next = path.get(pathIndex);
+        // Kiểm tra lại ô kế tiếp ngay trước khi bước: chất lỏng hoặc block có thể đã đổi từ lúc tính đường.
+        if (!Pathfinder.enterable(p.getWorld(), next, buildPath, canPlaceBlocks(p), walkKind == WalkKind.ESCAPE)) {
+            walkFailed(fp, action);
+            return;
+        }
         Location loc = p.getLocation();
         if (buildPath && !prepareStep(p, nms, Pathfinder.feetCell(loc), next)) {
             walkFailed(fp, action);
@@ -494,6 +522,10 @@ final class AutoMineSession {
                 phase = Phase.PLAN;
             }
             case EXPLORE -> phase = Phase.PLAN;
+            case ESCAPE -> {
+                escaping = false;
+                phase = Phase.PLAN;
+            }
         }
     }
 
@@ -510,6 +542,10 @@ final class AutoMineSession {
                 phase = Phase.PLAN;
             }
             case EXPLORE -> phase = Phase.PLAN;
+            case ESCAPE -> {
+                escaping = false;
+                phase = Phase.PLAN;
+            }
         }
     }
 
@@ -523,15 +559,15 @@ final class AutoMineSession {
     private boolean prepareStep(Player p, NMSServerPlayer nms, Pathfinder.Pos from, Pathfinder.Pos next) {
         World w = p.getWorld();
         if (next.y() > from.y() && !Pathfinder.passable(w, from.x(), from.y() + 2, from.z())
-                && !clearBlock(p, nms, w.getBlockAt(from.x(), from.y() + 2, from.z()))) {
+                && !clearBlock(p, nms, w.getBlockAt(from.x(), from.y() + 2, from.z()), from)) {
             return false;
         }
         if (!Pathfinder.passable(w, next.x(), next.y(), next.z())
-                && !clearBlock(p, nms, w.getBlockAt(next.x(), next.y(), next.z()))) {
+                && !clearBlock(p, nms, w.getBlockAt(next.x(), next.y(), next.z()), from)) {
             return false;
         }
         if (!Pathfinder.passable(w, next.x(), next.y() + 1, next.z())
-                && !clearBlock(p, nms, w.getBlockAt(next.x(), next.y() + 1, next.z()))) {
+                && !clearBlock(p, nms, w.getBlockAt(next.x(), next.y() + 1, next.z()), from)) {
             return false;
         }
         if (!Pathfinder.supports(w, next.x(), next.y() - 1, next.z())) {
@@ -540,10 +576,77 @@ final class AutoMineSession {
         return true;
     }
 
-    /** Phá một block chắn bằng công cụ tốt nhất trong túi; block rơi ra được nhặt sau. */
-    private boolean clearBlock(Player p, NMSServerPlayer nms, Block b) {
+    /**
+     * Thoát hiểm ngay. Nếu đầu hoặc chân nằm trong block đặc (ngạt) thì phá block đó trước, không cần
+     * kiểm tra chất lỏng kề vì ngạt là nguy hiểm tức thời. Nếu đang ở chất lỏng/lửa thì đi tới ô đứng
+     * an toàn gần nhất, được phép đi qua chất lỏng để ra ngoài.
+     */
+    private void escape(FakePlayer fp, Action action) {
+        Player p = fp.getPlayer();
+        NMSServerPlayer nms = fp.getNms();
+        World world = p.getWorld();
+        abortBreak(nms);
+        halt(nms);
+        Pathfinder.Pos c = Pathfinder.feetCell(p.getLocation());
+        for (int dy = 1; dy >= 0; dy--) {
+            Block b = world.getBlockAt(c.x(), c.y() + dy, c.z());
+            if (Pathfinder.breakableNow(b) && b.getLocation().distance(p.getLocation()) <= REACH_LIMIT + 1.0) {
+                selectTool(p, nms, b);
+                b.breakNaturally(p.getInventory().getItemInMainHand());
+                return;
+            }
+        }
+        Pathfinder.Result r = Pathfinder.findEscape(world, c, cell -> Pathfinder.walkable(world, cell),
+                ESCAPE_NODES, canPlaceBlocks(p));
+        if (!r.path().isEmpty()) {
+            startWalk(WalkKind.ESCAPE, null, null, r.path());
+            buildPath = true;
+            escaping = true;
+        }
+    }
+
+    /** Chỉ số ô trong túi có đồ ăn bot được phép ăn, hoặc -1. */
+    private static int foodSlot(PlayerInventory inv) {
+        for (int i = 0; i < 36; i++) {
+            ItemStack it = inv.getItem(i);
+            if (it != null && it.getType().isEdible() && !NEVER_EAT.contains(it.getType())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** Ăn một món khi đói (ngay trong tick). Trả về true nếu đã ăn. */
+    private static boolean eatFood(Player p) {
+        PlayerInventory inv = p.getInventory();
+        int slot = foodSlot(inv);
+        if (slot < 0) {
+            return false;
+        }
+        ItemStack it = inv.getItem(slot);
+        int nutrition = 4;
+        float saturation = 2.4f;
+        ItemMeta meta = it.getItemMeta();
+        if (meta != null && meta.getFood() != null) {
+            nutrition = meta.getFood().getNutrition();
+            saturation = meta.getFood().getSaturation();
+        }
+        p.setFoodLevel(Math.min(20, p.getFoodLevel() + nutrition));
+        p.setSaturation(Math.min(20f, p.getSaturation() + saturation));
+        if (it.getAmount() <= 1) {
+            inv.setItem(slot, null);
+        } else {
+            it.setAmount(it.getAmount() - 1);
+            inv.setItem(slot, it);
+        }
+        return true;
+    }
+
+    /** Phá một block chắn bằng công cụ tốt nhất trong túi; block rơi ra được nhặt sau. Chỉ phá khi an toàn. */
+    private boolean clearBlock(Player p, NMSServerPlayer nms, Block b, Pathfinder.Pos stand) {
         if (!Pathfinder.clearable(b.getWorld(), b.getX(), b.getY(), b.getZ())
-                || b.getLocation().distance(p.getLocation()) > REACH_LIMIT + 1.0) {
+                || b.getLocation().distance(p.getLocation()) > REACH_LIMIT + 1.0
+                || !Safety.breakSafe(b.getWorld(), stand, b)) {
             return false;
         }
         selectTool(p, nms, b);
