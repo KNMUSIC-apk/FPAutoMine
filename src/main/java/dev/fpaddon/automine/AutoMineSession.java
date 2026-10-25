@@ -103,6 +103,9 @@ final class AutoMineSession {
     private final Set<Pathfinder.Pos> blacklist = new HashSet<>();
     private final Set<Pathfinder.Pos> fullChests = new HashSet<>();
     private final Set<UUID> skippedItems = new HashSet<>();
+    /** Rương được chỉ định cho phiên: rương gần bot lúc bắt đầu, hoặc rương đầu tiên bot dùng để cất đồ. */
+    private Block homeChest;
+    private boolean homeChecked;
 
     AutoMineSession(Material material, int limit) {
         this.material = material;
@@ -148,6 +151,15 @@ final class AutoMineSession {
         NMSServerPlayer nms = fp.getNms();
         World world = p.getWorld();
         Pathfinder.Pos stand = Pathfinder.feetCell(p.getLocation());
+
+        // 0. Chỉ định rương của phiên: rương gần nhất lúc bắt đầu (nếu có).
+        if (!homeChecked) {
+            homeChecked = true;
+            List<Block> near = nearbyChests(p);
+            if (!near.isEmpty()) {
+                homeChest = near.get(0);
+            }
+        }
 
         // 1. Nhặt đồ rơi gần đó trước (block vừa đào rơi xuống đất).
         Item drop = nearestDrop(p);
@@ -691,40 +703,72 @@ final class AutoMineSession {
 
     // ------------------------------------------------------- CẤT ĐỒ VÀO RƯƠNG
 
-    /** Đi tới rương gần nhất (trong {@link #CHEST_RADIUS} block) để cất đồ; không có thì kết thúc. */
+    /**
+     * Cất đồ rồi kết thúc. Khi đủ chỉ tiêu, bot quay về rương đã chỉ định dù đang ở xa;
+     * không tới được thì dùng rương gần nhất trong {@link #CHEST_RADIUS} block. Không có rương nào
+     * tới được thì đồ còn lại trong túi.
+     */
     private void storeThenFinish(FakePlayer fp, Action action, StoreReason reason) {
         Player p = fp.getPlayer();
-        World world = p.getWorld();
         Pathfinder.Pos stand = Pathfinder.feetCell(p.getLocation());
+        if (reason == StoreReason.QUOTA && homeChest != null && isChest(homeChest)
+                && homeChest.getWorld() == p.getWorld() && !fullChests.contains(Pathfinder.posOf(homeChest))) {
+            if (startStoreWalk(p, stand, homeChest, reason)) {
+                return;
+            }
+        }
         for (Block chest : nearbyChests(p)) {
-            Pathfinder.Pos key = Pathfinder.posOf(chest);
-            if (fullChests.contains(key)) {
-                continue;
-            }
-            Pathfinder.Result r = Pathfinder.find(world, stand,
-                    cell -> Pathfinder.distToCenter(cell, chest) <= 3.0, key, Pathfinder.MAX_NODES, false);
-            if (r.reached()) {
-                pendingStore = reason;
-                startWalk(WalkKind.CHEST, chest, null, r.path());
+            if (!fullChests.contains(Pathfinder.posOf(chest)) && startStoreWalk(p, stand, chest, reason)) {
                 return;
             }
-            // Không với tới bằng đường đi bộ: thử đường được phép phá và đặt block.
-            Pathfinder.Result built = Pathfinder.findBuild(world, stand,
-                    cell -> Pathfinder.distToCenter(cell, chest) <= 3.0, key, Pathfinder.MAX_BUILD_NODES,
-                    canPlaceBlocks(p));
-            if (built.reached()) {
-                pendingStore = reason;
-                startWalk(WalkKind.CHEST, chest, null, built.path());
-                buildPath = true;
-                return;
-            }
-            fullChests.add(key);
         }
         pendingStore = null;
         String why = reason == StoreReason.QUOTA
-                ? "đủ " + limit + " block"
+                ? "đủ " + limit + " block, không tới được rương nên đồ còn trong túi"
                 : "túi đầy và không có rương trong " + CHEST_RADIUS + " block";
         finish(fp, action, why);
+    }
+
+    /**
+     * Lập đường tới rương để cất đồ: đi bộ, hoặc phá/đặt block nếu cần. Nếu không tới được thì
+     * đánh dấu rương và trả về false.
+     */
+    private boolean startStoreWalk(Player p, Pathfinder.Pos stand, Block chest, StoreReason reason) {
+        World world = p.getWorld();
+        Pathfinder.Pos key = Pathfinder.posOf(chest);
+        Pathfinder.Result r = Pathfinder.find(world, stand,
+                cell -> Pathfinder.distToCenter(cell, chest) <= 3.0, key, Pathfinder.MAX_NODES, false);
+        if (r.reached()) {
+            pendingStore = reason;
+            startWalk(WalkKind.CHEST, chest, null, r.path());
+            rememberHome(chest);
+            return true;
+        }
+        // Không với tới bằng đường đi bộ: thử đường được phép phá và đặt block.
+        Pathfinder.Result built = Pathfinder.findBuild(world, stand,
+                cell -> Pathfinder.distToCenter(cell, chest) <= 3.0, key, Pathfinder.MAX_BUILD_NODES,
+                canPlaceBlocks(p));
+        if (built.reached()) {
+            pendingStore = reason;
+            startWalk(WalkKind.CHEST, chest, null, built.path());
+            buildPath = true;
+            rememberHome(chest);
+            return true;
+        }
+        fullChests.add(key);
+        return false;
+    }
+
+    /** Rương đầu tiên bot dùng để cất đồ trở thành rương đã chỉ định (nếu lúc bắt đầu chưa có). */
+    private void rememberHome(Block chest) {
+        if (homeChest == null) {
+            homeChest = chest;
+        }
+    }
+
+    private static boolean isChest(Block b) {
+        Material m = b.getType();
+        return m == Material.CHEST || m == Material.TRAPPED_CHEST;
     }
 
     private List<Block> nearbyChests(Player p) {
@@ -765,7 +809,7 @@ final class AutoMineSession {
         int moved = 0;
         BlockState state = chestBlock.getState();
         if (state instanceof Chest chest) {
-            moved = transferToChest(p, chest.getInventory());
+            moved = transferToChest(p, chest.getInventory(), reason == StoreReason.QUOTA);
         }
         if (moved == 0) {
             fullChests.add(Pathfinder.posOf(chestBlock));
@@ -774,21 +818,25 @@ final class AutoMineSession {
         }
 
         if (reason == StoreReason.QUOTA) {
-            finish(fp, action, moved > 0
-                    ? "đủ " + limit + " block, đã cất đồ vào rương"
-                    : "đủ " + limit + " block, rương đầy nên đồ còn trong túi");
+            String result = bagEmpty(p) ? "đã cất toàn bộ đồ vào rương"
+                    : moved > 0 ? "đã cất một phần đồ vào rương, phần còn lại không vừa"
+                    : "rương đầy nên đồ còn trong túi";
+            finish(fp, action, "đủ " + limit + " block, " + result);
             return;
         }
         phase = Phase.PLAN;
     }
 
-    /** Chuyển mọi đồ trong túi (trừ công cụ và đồ ăn) vào rương. Trả về số lượng đã chuyển. */
-    private static int transferToChest(Player p, Inventory chestInv) {
+    /**
+     * Chuyển đồ trong túi vào rương. Khi {@code everything} là false thì giữ lại công cụ và đồ ăn
+     * để bot tiếp tục đào. Trả về số lượng đã chuyển.
+     */
+    private static int transferToChest(Player p, Inventory chestInv, boolean everything) {
         PlayerInventory bag = p.getInventory();
         int moved = 0;
         for (int i = 0; i < 36; i++) {
             ItemStack it = bag.getItem(i);
-            if (it == null || it.getType().isAir() || keepInBag(it.getType())) {
+            if (it == null || it.getType().isAir() || (!everything && keepInBag(it.getType()))) {
                 continue;
             }
             int amount = it.getAmount();
@@ -809,7 +857,18 @@ final class AutoMineSession {
         return moved;
     }
 
-    /** Công cụ và đồ ăn giữ lại trong túi bot. */
+    private static boolean bagEmpty(Player p) {
+        PlayerInventory bag = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            ItemStack it = bag.getItem(i);
+            if (it != null && !it.getType().isAir()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Công cụ và đồ ăn giữ lại trong túi bot khi đang đào (túi đầy giữa chừng). */
     private static boolean keepInBag(Material m) {
         if (m.isEdible()) {
             return true;
