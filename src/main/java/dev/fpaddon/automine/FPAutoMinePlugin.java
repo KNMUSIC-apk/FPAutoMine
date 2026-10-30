@@ -22,9 +22,12 @@ public final class FPAutoMinePlugin extends JavaPlugin {
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+        saveDefaultConfig();
+        Settings.load(getConfig());
+        AutoMineHandler handler = new AutoMineHandler();
         api.getGlobalActionRegistry().register(
-                AutoMineAction.class, ACTION_NAME, "continuous", new AutoMineHandler());
-        getServer().getPluginManager().registerEvents(new CommandListener(api), this);
+                AutoMineAction.class, ACTION_NAME, "continuous", handler);
+        getServer().getPluginManager().registerEvents(new CommandListener(api, handler), this);
         getServer().getPluginManager().registerEvents(new MobListener(api), this);
         getLogger().info("Đã đăng ký action '" + ACTION_NAME + "'. Dùng: /fp action start mine <block> [số lượng|-] [tên bot]");
     }

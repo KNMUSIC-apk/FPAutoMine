@@ -47,6 +47,12 @@ public final class AutoMineHandler implements ActionHandler<AutoMineAction> {
         }
     }
 
+    /** Mô tả phiên đang chạy của bot (theo UUID), hoặc null nếu bot không auto-mine. */
+    String describe(UUID botId) {
+        AutoMineSession session = sessions.get(botId);
+        return session == null ? null : session.describe();
+    }
+
     @Override
     public void onStop(FakePlayer fakePlayer, AutoMineAction action, String mode, Map<String, String> parameters) {
         AutoMineSession session = sessions.remove(fakePlayer.getUuid());
