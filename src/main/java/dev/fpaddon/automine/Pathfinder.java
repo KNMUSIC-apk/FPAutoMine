@@ -25,6 +25,9 @@ import java.util.Set;
  *
  * <p>Có hai chế độ: đi bộ thuần ({@link #find}) và chế độ build ({@link #findBuild}),
  * trong đó được phép phá block chắn đường và đặt block lấp chỗ hổng dưới chân.
+ *
+ * <p>Thuật toán đọc block qua {@link BlockView}, nên cùng một mã có thể chạy trên thread chính
+ * (đọc thế giới) hoặc trên thread phụ (đọc ảnh chụp chunk).
  */
 final class Pathfinder {
 
@@ -96,7 +99,7 @@ final class Pathfinder {
      * @param bestEffort   nếu không tới được đích, trả về đường tới ô gần {@code hint} nhất
      */
     static Result find(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean bestEffort) {
-        return search(world, start, goal, hint, maxNodes, bestEffort, false, false, false);
+        return search(BlockView.of(world), start, goal, hint, maxNodes, bestEffort, false, false, false);
     }
 
     /**
@@ -104,7 +107,7 @@ final class Pathfinder {
      * chất lỏng và đứng tạm trên chất lỏng, đích là ô đứng an toàn ({@link #walkable}).
      */
     static Result findEscape(World world, Pos start, Goal goal, int maxNodes, boolean canPlace) {
-        return search(world, start, goal, null, maxNodes, false, true, canPlace, true);
+        return search(BlockView.of(world), start, goal, null, maxNodes, false, true, canPlace, true);
     }
 
     /**
@@ -118,13 +121,13 @@ final class Pathfinder {
     /** Như {@link #findBuild(World, Pos, Goal, Pos, int, boolean)}; {@code bestEffort} trả về đường tới ô gần đích nhất. */
     static Result findBuild(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean canPlace,
                             boolean bestEffort) {
-        return search(world, start, goal, hint, maxNodes, bestEffort, true, canPlace, false);
+        return search(BlockView.of(world), start, goal, hint, maxNodes, bestEffort, true, canPlace, false);
     }
 
     /** Đọc hết một lần tìm đường trong một lượt (khi cần kết quả ngay: thoát hiểm, cất đồ). */
-    private static Result search(World world, Pos start, Goal goal, Pos hint, int maxNodes,
+    private static Result search(BlockView view, Pos start, Goal goal, Pos hint, int maxNodes,
                                  boolean bestEffort, boolean build, boolean canPlace, boolean escape) {
-        Search s = new Search(world, start, goal, hint, maxNodes, bestEffort, build, canPlace, escape);
+        Search s = new Search(view, start, goal, hint, maxNodes, bestEffort, build, canPlace, escape);
         while (!s.done()) {
             s.step(Integer.MAX_VALUE);
         }
@@ -134,9 +137,10 @@ final class Pathfinder {
     /**
      * Một lần tìm đường có thể tạm dừng. Mỗi lần {@link #step} chỉ mở rộng một số nút được cấp,
      * nên việc tìm đường trải qua nhiều tick thay vì chặn server trong một tick.
+     * Khi đọc từ {@link BlockView.SnapshotView} và goal không gọi API Bukkit, lần tìm có thể chạy trên thread phụ.
      */
     static final class Search {
-        private final World world;
+        private final BlockView view;
         private final Pos start;
         private final Goal goal;
         private final Pos hint;
@@ -157,9 +161,9 @@ final class Pathfinder {
         private int expanded;
         private Result result;
 
-        Search(World world, Pos start, Goal goal, Pos hint, int maxNodes, boolean bestEffort,
+        Search(BlockView view, Pos start, Goal goal, Pos hint, int maxNodes, boolean bestEffort,
                boolean build, boolean canPlace, boolean escape) {
-            this.world = world;
+            this.view = view;
             this.start = start;
             this.goal = goal;
             this.hint = hint;
@@ -198,6 +202,11 @@ final class Pathfinder {
 
         Result result() {
             return result;
+        }
+
+        /** Số nút đã mở rộng cho tới nay (để hiển thị tiến độ). */
+        int expanded() {
+            return expanded;
         }
 
         /**
@@ -251,8 +260,8 @@ final class Pathfinder {
                     }
                     double extra = 0.0;
                     // Bước lên 1 block cần chỗ trống ở trên đầu vị trí hiện tại.
-                    if (step == 1 && !passable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z(), escape)) {
-                        if (!build || !clearable(world, cur.pos().x(), cur.pos().y() + 2, cur.pos().z())) {
+                    if (step == 1 && !passable(view, cur.pos().x(), cur.pos().y() + 2, cur.pos().z(), escape)) {
+                        if (!build || !clearable(view, cur.pos().x(), cur.pos().y() + 2, cur.pos().z())) {
                             continue;
                         }
                         extra += CLEAR_COST;
@@ -261,7 +270,7 @@ final class Pathfinder {
                         continue;
                     }
                     double enter = enterMemo.computeIfAbsent(next,
-                            q -> enterCost(world, q, build, canPlace, escape));
+                            q -> enterCost(view, q, build, canPlace, escape));
                     if (enter < 0) {
                         continue;
                     }
@@ -294,29 +303,78 @@ final class Pathfinder {
         return path;
     }
 
-    private static boolean inRange(World world, int y) {
-        return y >= world.getMinHeight() && y < world.getMaxHeight();
+    private static boolean inRange(BlockView v, int y) {
+        return y >= v.minY() && y < v.maxY();
+    }
+
+    /**
+     * Ô đứng đủ gần block (theo khoảng cách từ mắt bot tới tâm block), không xét tường chắn.
+     * Đây là điều kiện đọc được trên thread phụ; đường tới đích được kiểm tra lại bằng
+     * {@link #canMine} trên thread chính trước khi dùng.
+     */
+    static boolean inReachOf(Pos cell, Pos block, double reach) {
+        double dx = block.x() + 0.5 - (cell.x() + 0.5);
+        double dy = block.y() + 0.5 - (cell.y() + EYE_HEIGHT);
+        double dz = block.z() + 0.5 - (cell.z() + 0.5);
+        return Math.sqrt(dx * dx + dy * dy + dz * dz) <= reach;
+    }
+
+    /**
+     * Xấp xỉ tia nhìn từ mắt bot đứng ở {@code cell} tới tâm {@code block}, chỉ đọc qua {@link BlockView}
+     * (đọc được trên thread phụ). Không phải tia quét chính xác của thế giới; đường được chọn vẫn phải
+     * qua {@link #canMine} trên thread chính trước khi dùng.
+     */
+    static boolean losClear(BlockView v, Pos cell, Pos block) {
+        double sx = cell.x() + 0.5;
+        double sy = cell.y() + EYE_HEIGHT;
+        double sz = cell.z() + 0.5;
+        double dx = block.x() + 0.5 - sx;
+        double dy = block.y() + 0.5 - sy;
+        double dz = block.z() + 0.5 - sz;
+        int steps = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dy * dy + dz * dz) / 0.2));
+        for (int i = 1; i < steps; i++) {
+            double t = (double) i / steps;
+            int bx = (int) Math.floor(sx + dx * t);
+            int by = (int) Math.floor(sy + dy * t);
+            int bz = (int) Math.floor(sz + dz * t);
+            if (bx == block.x() && by == block.y() && bz == block.z()) {
+                continue;
+            }
+            Material m = v.type(bx, by, bz);
+            if (m == null || m.isSolid()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     static boolean passable(World world, int x, int y, int z) {
-        return passable(world, x, y, z, false);
+        return passable(BlockView.of(world), x, y, z, false);
+    }
+
+    static boolean passable(World world, int x, int y, int z, boolean escape) {
+        return passable(BlockView.of(world), x, y, z, escape);
     }
 
     /** Ô bot có thể chiếm (không phải block đặc). Khi thoát hiểm thì chất lỏng/lửa cũng được coi là chiếm được. */
-    static boolean passable(World world, int x, int y, int z, boolean escape) {
-        if (!inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+    static boolean passable(BlockView v, int x, int y, int z, boolean escape) {
+        if (!inRange(v, y)) {
             return false;
         }
-        Block b = world.getBlockAt(x, y, z);
-        return b.isPassable() && (escape || !HAZARDS.contains(b.getType()));
+        Material m = v.type(x, y, z);
+        return m != null && v.passable(x, y, z) && (escape || !HAZARDS.contains(m));
     }
 
     static boolean supports(World world, int x, int y, int z) {
-        if (!inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+        return supports(BlockView.of(world), x, y, z);
+    }
+
+    static boolean supports(BlockView v, int x, int y, int z) {
+        if (!inRange(v, y)) {
             return false;
         }
-        Material m = world.getBlockAt(x, y, z).getType();
-        return m.isSolid() && !HAZARDS.contains(m);
+        Material m = v.type(x, y, z);
+        return m != null && m.isSolid() && !HAZARDS.contains(m);
     }
 
     /**
@@ -324,12 +382,16 @@ final class Pathfinder {
      * không bất khả phá và không phải vật chứa đồ (tránh làm mất đồ trong rương).
      */
     static boolean clearable(World world, int x, int y, int z) {
-        if (!inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+        return clearable(BlockView.of(world), x, y, z);
+    }
+
+    static boolean clearable(BlockView v, int x, int y, int z) {
+        if (!inRange(v, y)) {
             return false;
         }
-        Material m = world.getBlockAt(x, y, z).getType();
-        return m.isSolid() && !HAZARDS.contains(m) && !UNBREAKABLE.contains(m) && !protectedBlock(m)
-                && !Safety.fluidAdjacent(world, x, y, z);
+        Material m = v.type(x, y, z);
+        return m != null && m.isSolid() && !HAZARDS.contains(m) && !UNBREAKABLE.contains(m) && !protectedBlock(m)
+                && !Safety.fluidAdjacent(v, x, y, z);
     }
 
     /**
@@ -355,58 +417,59 @@ final class Pathfinder {
      * Chi phí để bot đứng vào ô {@code p} (chân và đầu thoáng, có đất đỡ).
      * Trả về -1 nếu không đi được; ở chế độ build, phần bị chắn/hổng được tính thêm chi phí.
      */
-    private static double enterCost(World world, Pos p, boolean build, boolean canPlace, boolean escape) {
+    private static double enterCost(BlockView v, Pos p, boolean build, boolean canPlace, boolean escape) {
         // Sát đáy thế giới: có thể rơi vào void, không đứng ở đó.
-        if (p.y() < world.getMinHeight() + Safety.VOID_MARGIN) {
+        if (p.y() < v.minY() + Safety.VOID_MARGIN) {
             return -1;
         }
         double cost = 0.0;
-        if (!passable(world, p.x(), p.y(), p.z(), escape)) {
-            if (!build || !clearable(world, p.x(), p.y(), p.z())) {
+        if (!passable(v, p.x(), p.y(), p.z(), escape)) {
+            if (!build || !clearable(v, p.x(), p.y(), p.z())) {
                 return -1;
             }
             cost += CLEAR_COST;
         }
-        if (!passable(world, p.x(), p.y() + 1, p.z(), escape)) {
-            if (!build || !clearable(world, p.x(), p.y() + 1, p.z())) {
+        if (!passable(v, p.x(), p.y() + 1, p.z(), escape)) {
+            if (!build || !clearable(v, p.x(), p.y() + 1, p.z())) {
                 return -1;
             }
             cost += CLEAR_COST;
         }
-        if (!ground(world, p.x(), p.y() - 1, p.z(), escape)) {
-            if (!build || !canPlace || !passable(world, p.x(), p.y() - 1, p.z())) {
+        if (!ground(v, p.x(), p.y() - 1, p.z(), escape)) {
+            if (!build || !canPlace || !passable(v, p.x(), p.y() - 1, p.z(), false)) {
                 return -1;
             }
             cost += PLACE_COST;
         }
         // Phạt theo nguy hiểm kề bên (dung nham, lửa, nước, block rơi) để lộ trình tránh xa chúng.
-        return cost + Safety.hazardCost(world, p.x(), p.y(), p.z());
+        return cost + Safety.hazardCost(v, p.x(), p.y(), p.z());
     }
 
     /** Có đất đỡ ở ô (x, y, z). Khi thoát hiểm, chất lỏng/block nóng cũng tạm coi là đỡ được. */
-    private static boolean ground(World world, int x, int y, int z, boolean escape) {
-        if (supports(world, x, y, z)) {
+    private static boolean ground(BlockView v, int x, int y, int z, boolean escape) {
+        if (supports(v, x, y, z)) {
             return true;
         }
-        if (!escape || !inRange(world, y) || !world.isChunkLoaded(x >> 4, z >> 4)) {
+        if (!escape || !inRange(v, y)) {
             return false;
         }
-        Material m = world.getBlockAt(x, y, z).getType();
-        return m.isSolid() || HAZARDS.contains(m);
+        Material m = v.type(x, y, z);
+        return m != null && (m.isSolid() || HAZARDS.contains(m));
     }
 
     static boolean walkable(World world, Pos p) {
-        return enterCost(world, p, false, false, false) >= 0;
+        return enterCost(BlockView.of(world), p, false, false, false) >= 0;
     }
 
     /** Ô đứng hợp lệ ngay lúc này, dùng để kiểm tra lại ô kế tiếp trước khi bước (thế giới có thể đã đổi). */
     static boolean enterable(World world, Pos p, boolean build, boolean canPlace, boolean escape) {
-        return enterCost(world, p, build, canPlace, escape) >= 0;
+        return enterCost(BlockView.of(world), p, build, canPlace, escape) >= 0;
     }
 
     /**
      * Bot đứng ở {@code stand} có đào được {@code target} không: trong tầm với
      * và tia nhìn từ mắt tới tâm block trúng đúng block đó (không bị chắn).
+     * Chỉ dùng trên thread chính (dùng tia quét của thế giới).
      */
     static boolean canMine(World world, Pos stand, Block target, double reach) {
         double ex = stand.x() + 0.5;
@@ -419,7 +482,7 @@ final class Pathfinder {
         if (dist > reach) {
             return false;
         }
-        if (!Safety.breakSafe(world, stand, target)) {
+        if (!Safety.breakSafe(BlockView.of(world), stand, target)) {
             return false;
         }
         if (!target.getType().isSolid()) {

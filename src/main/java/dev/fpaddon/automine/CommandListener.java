@@ -32,9 +32,11 @@ final class CommandListener implements Listener {
     private static final int MAX_BLOCK_EXAMPLES = 50;
 
     private final FakePlayerPlusPluginApi api;
+    private final AutoMineHandler handler;
 
-    CommandListener(FakePlayerPlusPluginApi api) {
+    CommandListener(FakePlayerPlusPluginApi api, AutoMineHandler handler) {
         this.api = api;
+        this.handler = handler;
     }
 
     @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
@@ -161,6 +163,9 @@ final class CommandListener implements Listener {
         if (t[2].equalsIgnoreCase("stop")) {
             return handleStop(sender, t);
         }
+        if (t[2].equalsIgnoreCase("status")) {
+            return handleStatus(sender, t);
+        }
         return false;
     }
 
@@ -216,6 +221,24 @@ final class CommandListener implements Listener {
                 + (limit < 0
                         ? " (không giới hạn: đầy túi thì cất vào rương trong 10 block nếu có)"
                         : " (mục tiêu " + limit + " block)") + ".");
+        return true;
+    }
+
+    /** {@code /fpautomine status [tên bot]}: cho biết bot đang làm gì trong phiên auto-mine. */
+    private boolean handleStatus(CommandSender sender, String[] t) {
+        if (t.length > 5) {
+            return false;
+        }
+        String botName = t.length == 5 ? t[4] : null;
+        FakePlayer bot = pickBot(sender, botName);
+        if (bot == null) {
+            sender.sendMessage(PREFIX + (botName == null
+                    ? "Bạn có nhiều bot, hãy thêm tên bot vào cuối lệnh, ví dụ: /fpautomine status Miner01."
+                    : "Không tìm thấy bot " + botName + " hoặc bạn không có quyền."));
+            return true;
+        }
+        String info = handler.describe(bot.getUuid());
+        sender.sendMessage(PREFIX + bot.getName() + ": " + (info == null ? "không chạy auto-mine." : info));
         return true;
     }
 

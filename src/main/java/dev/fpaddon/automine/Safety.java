@@ -11,6 +11,8 @@ import java.util.Set;
  * Các kiểm tra an toàn cho từng nước đi và từng lần đào: tránh rơi vào void, ngạt (đứng trong
  * block đặc), chết trong dung nham/lửa/nước, rơi quá cao, và block rơi (cát, sỏi) đè lên bot.
  * Pathfinder, lúc đi và lúc đào đều hỏi module này trước khi quyết định.
+ *
+ * <p>Các hàm đọc block đều nhận {@link BlockView}, nên chạy được cả trên thread phụ (tìm đường).
  */
 final class Safety {
 
@@ -29,22 +31,14 @@ final class Safety {
     private Safety() {
     }
 
-    /** Loại block tại toạ độ; null nếu ngoài thế giới hoặc chunk chưa nạp (coi là chưa biết). */
-    static Material type(World w, int x, int y, int z) {
-        if (y < w.getMinHeight() || y >= w.getMaxHeight() || !w.isChunkLoaded(x >> 4, z >> 4)) {
-            return null;
-        }
-        return w.getBlockAt(x, y, z).getType();
-    }
-
     static boolean isFluid(Material m) {
         return m == Material.LAVA || m == Material.WATER;
     }
 
     /** Có chất lỏng ở một trong 6 ô kề với ô này (hoặc có ô kề chưa biết). Chất lỏng sẽ chảy vào chỗ trống. */
-    static boolean fluidAdjacent(World w, int x, int y, int z) {
+    static boolean fluidAdjacent(BlockView v, int x, int y, int z) {
         for (int i = 0; i < 6; i++) {
-            Material m = type(w, x + DX[i], y + DY[i], z + DZ[i]);
+            Material m = v.type(x + DX[i], y + DY[i], z + DZ[i]);
             if (m == null || isFluid(m)) {
                 return true;
             }
@@ -56,10 +50,10 @@ final class Safety {
      * Nếu ô (x, y, z) đang trống và một bot ở đó rơi xuống, trả về y của chân khi chạm đất.
      * Trả về -1 nếu rơi qua chất lỏng/lửa, chạm block nguy hiểm, rơi vào void, hoặc rơi quá xa.
      */
-    static int landingY(World w, int x, int y, int z) {
+    static int landingY(BlockView v, int x, int y, int z) {
         int yy = y;
         for (int fall = 0; fall <= SAFE_FALL + 1; fall++) {
-            Material below = type(w, x, yy - 1, z);
+            Material below = v.type(x, yy - 1, z);
             if (below == null) {
                 return -1;
             }
@@ -84,23 +78,23 @@ final class Safety {
      *       {@link #SAFE_FALL} block.</li>
      * </ul>
      */
-    static boolean breakSafe(World w, Pathfinder.Pos stand, Block x) {
+    static boolean breakSafe(BlockView v, Pathfinder.Pos stand, Block x) {
         int bx = x.getX();
         int by = x.getY();
         int bz = x.getZ();
-        if (fluidAdjacent(w, bx, by, bz)) {
+        if (fluidAdjacent(v, bx, by, bz)) {
             return false;
         }
-        Material above = type(w, bx, by + 1, bz);
+        Material above = v.type(bx, by + 1, bz);
         if (above != null && above.hasGravity() && stand.x() == bx && stand.z() == bz && stand.y() <= by + 2) {
             return false;
         }
         if (bx == stand.x() && bz == stand.z() && by == stand.y() - 1) {
-            int landing = landingY(w, bx, by, bz);
-            if (landing < 0 || stand.y() - landing > SAFE_FALL || landing < w.getMinHeight() + VOID_MARGIN) {
+            int landing = landingY(v, bx, by, bz);
+            if (landing < 0 || stand.y() - landing > SAFE_FALL || landing < v.minY() + VOID_MARGIN) {
                 return false;
             }
-            if (landing != by && fluidAdjacent(w, bx, landing, bz)) {
+            if (landing != by && fluidAdjacent(v, bx, landing, bz)) {
                 return false;
             }
         }
@@ -111,16 +105,18 @@ final class Safety {
      * Bot đang gặp nguy hiểm ngay lúc này: chân hoặc đầu trong chất lỏng/lửa, đứng trên block nóng,
      * chân hoặc đầu nằm trong block đặc (ngạt), hoặc sát đáy thế giới.
      * Trả về false khi chưa biết trạng thái ô (chunk chưa nạp), để không hoảng loạn vô cớ.
+     * Chỉ dùng trên thread chính.
      */
     static boolean inDanger(World w, Location loc) {
+        BlockView v = BlockView.of(w);
         Pathfinder.Pos c = Pathfinder.feetCell(loc);
-        Material feet = type(w, c.x(), c.y(), c.z());
-        Material head = type(w, c.x(), c.y() + 1, c.z());
-        Material ground = type(w, c.x(), c.y() - 1, c.z());
+        Material feet = v.type(c.x(), c.y(), c.z());
+        Material head = v.type(c.x(), c.y() + 1, c.z());
+        Material ground = v.type(c.x(), c.y() - 1, c.z());
         if (feet == null || head == null) {
             return false;
         }
-        if (c.y() < w.getMinHeight() + 1) {
+        if (c.y() < v.minY() + 1) {
             return true;
         }
         if (Pathfinder.HAZARDS.contains(feet) || Pathfinder.HAZARDS.contains(head)) {
@@ -137,10 +133,10 @@ final class Safety {
      * Chi phí phạt khi đứng ở ô này vì nguy hiểm kề bên: dung nham/lửa rất nặng, nước nhẹ hơn,
      * và block rơi phía trên đầu. Giúp lộ trình tránh sát dung nham, nước và chỗ có thể bị đè.
      */
-    static double hazardCost(World w, int x, int y, int z) {
+    static double hazardCost(BlockView v, int x, int y, int z) {
         double cost = 0.0;
         for (int i = 0; i < 6; i++) {
-            Material m = type(w, x + DX[i], y + DY[i], z + DZ[i]);
+            Material m = v.type(x + DX[i], y + DY[i], z + DZ[i]);
             if (m == null) {
                 continue;
             }
@@ -150,7 +146,7 @@ final class Safety {
                 cost += 3.0;
             }
         }
-        Material overHead = type(w, x, y + 2, z);
+        Material overHead = v.type(x, y + 2, z);
         if (overHead != null && overHead.hasGravity()) {
             cost += 3.0;
         }

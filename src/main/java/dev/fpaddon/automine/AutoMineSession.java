@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -50,13 +51,10 @@ import java.util.function.Supplier;
  */
 final class AutoMineSession {
 
-    private static final int SEARCH_RADIUS_XZ = 24;
     private static final int SEARCH_RADIUS_Y = 12;
     private static final int CHEST_RADIUS = 10;
     private static final int PICKUP_RADIUS = 6;
     private static final int MAX_EXPLORE = 60;
-    private static final int MOB_SWEEP_TICKS = 60;
-    private static final double MOB_SWEEP_RADIUS = 25.0;
     /** cos của nửa góc 60°: block có hướng lệch không quá 60° so với hướng nhìn được coi là "phía trước". */
     private static final double FRONT_COS = 0.5;
     private static final int MAX_KNOWN_CHESTS = 16;
@@ -77,10 +75,6 @@ final class AutoMineSession {
     private static final int MAX_BREAK_FAILURES = 3;
     private static final double MAX_SCAN_DRIFT = 16.0;
     private static final double REACH_LIMIT = 4.2;
-    /** Số nút A* tối đa một bot mở rộng trong một tick (trần riêng, ngoài ngân sách chung). */
-    private static final int SEARCH_STEP_NODES = 400;
-    /** Số đơn vị ngân sách tối đa một bot dùng để quét block trong một tick. */
-    private static final int SCAN_UNITS_PER_STEP = 3000;
 
     private enum Phase { PLAN, WALK, MINE, VERIFY }
 
@@ -156,18 +150,25 @@ final class AutoMineSession {
     private List<Block> scanFound;
     /** Block đang được xét để đi tới: đường đi bộ trước, rồi đường build. */
     private Block candidate;
-    private boolean candidateBuild;
+    /** Giai đoạn xét block mục tiêu: 0 = đi bộ bất đồng bộ (xấp xỉ), 1 = đi bộ chính xác, 2 = đường build. */
+    private int candidateStage;
     private int targetTries;
     private int targetBuilds;
     /** Điểm khám phá đang đi tới (chọn một lần, giữ nguyên cho tới khi tìm được đường). */
     private Pathfinder.Pos exploreHint;
     /** Bot đang chờ tính đường/quét ở tick này: đứng im và không làm việc khác. */
     private boolean waiting;
+    /** Việc tìm đường đang giao cho thread phụ, và tag khoá của nó. */
+    private AsyncPlanner.Job asyncJob;
+    private String asyncTag;
+    /** Quét theo bán kính tăng dần: chỉ số bán kính hiện tại, và bán kính của vòng trước (đã quét xong). */
+    private int scanLevel;
+    private int scanPrevRadius;
 
     AutoMineSession(Material material, int limit) {
         this.material = material;
         this.limit = limit;
-        this.mobSweepIn = ThreadLocalRandom.current().nextInt(1, MOB_SWEEP_TICKS + 1);
+        this.mobSweepIn = ThreadLocalRandom.current().nextInt(1, Settings.mobSweepTicks + 1);
     }
 
     String materialName() {
@@ -182,7 +183,7 @@ final class AutoMineSession {
             return;
         }
         if (--mobSweepIn <= 0) {
-            mobSweepIn = MOB_SWEEP_TICKS;
+            mobSweepIn = Settings.mobSweepTicks;
             sweepMobs(p);
         }
         NMSServerPlayer nms = fp.getNms();
@@ -207,7 +208,7 @@ final class AutoMineSession {
             case PLAN -> plan(fp, action);
             case WALK -> walk(fp, action);
             case MINE -> mine(fp, action);
-            case VERIFY -> verify();
+            case VERIFY -> verify(p, nms);
         }
     }
 
@@ -224,10 +225,15 @@ final class AutoMineSession {
     private void resetSearch() {
         pendingSearch = null;
         pendingTag = null;
+        if (asyncJob != null) {
+            asyncJob.cancel();
+        }
+        asyncJob = null;
+        asyncTag = null;
         scanning = false;
         scanFound = null;
         candidate = null;
-        candidateBuild = false;
+        candidateStage = 0;
         targetTries = 0;
         targetBuilds = 0;
         exploreHint = null;
@@ -243,9 +249,9 @@ final class AutoMineSession {
             pendingSearch = factory.get();
             pendingTag = tag;
         }
-        int units = Throttle.take(SEARCH_STEP_NODES * Throttle.EXPAND_COST);
-        int spent = pendingSearch.step(units / Throttle.EXPAND_COST);
-        Throttle.refund(units - spent * Throttle.EXPAND_COST);
+        int units = Throttle.take(Settings.searchStepNodes * Throttle.expandCost());
+        int spent = pendingSearch.step(units / Throttle.expandCost());
+        Throttle.refund(units - spent * Throttle.expandCost());
         if (!pendingSearch.done()) {
             return null;
         }
@@ -253,6 +259,112 @@ final class AutoMineSession {
         pendingSearch = null;
         pendingTag = null;
         return r;
+    }
+
+    /**
+     * Tìm đường với goal chỉ dựa trên hình học. Khi bật {@code search.async} thì chạy trên thread phụ,
+     * ngược lại chạy bằng {@link #resumable} trên thread chính. Trả về null nếu chưa xong.
+     */
+    private Pathfinder.Result planGeometric(World world, String tag, Pathfinder.Pos start, Pathfinder.Goal goal,
+                                            Pathfinder.Pos hint, boolean build, boolean canPlace, boolean bestEffort) {
+        if (!Settings.asyncPathfinding) {
+            return resumable(tag, () -> new Pathfinder.Search(BlockView.of(world), start, goal, hint,
+                    Pathfinder.MAX_NODES, bestEffort, build, canPlace, false));
+        }
+        return asyncSearch(world, tag, start, view -> new Pathfinder.Search(view, start, goal, hint,
+                Pathfinder.MAX_NODES, bestEffort, build, canPlace, false));
+    }
+
+    /**
+     * Giao một lần tìm đường cho thread phụ, hoặc lấy kết quả nếu đã xong. Tag gồm cả vị trí đứng: nếu bot
+     * đã đi chỗ khác thì huỷ việc cũ và giao việc mới. Trả về null khi chưa có kết quả.
+     */
+    private Pathfinder.Result asyncSearch(World world, String tag, Pathfinder.Pos start,
+                                          Function<BlockView, Pathfinder.Search> make) {
+        if (asyncJob != null && tag.equals(asyncTag)) {
+            Pathfinder.Result r = asyncJob.result();
+            if (r == null) {
+                return null;
+            }
+            asyncJob = null;
+            asyncTag = null;
+            return r;
+        }
+        if (asyncJob != null) {
+            asyncJob.cancel();
+        }
+        // Chụp (hoặc dùng lại ảnh chụp gần đây của) các chunk trong phạm vi tìm đường, rồi giao việc cho thread phụ.
+        BlockView view = AsyncPlanner.viewAround(world, start, Pathfinder.MAX_RADIUS);
+        asyncJob = AsyncPlanner.submit(plugin(), make.apply(view));
+        asyncTag = tag;
+        return null;
+    }
+
+    /**
+     * Đào theo mạch: sau khi đào xong, nếu một block cùng loại kề bên đào được ngay từ chỗ đứng
+     * và túi còn chỗ cho đồ rơi thì đào luôn, không cần tìm đường. Trả về true nếu đã chọn block đó.
+     */
+    private boolean tryVein(Player p, NMSServerPlayer nms, Pathfinder.Pos from) {
+        World world = p.getWorld();
+        Pathfinder.Pos stand = Pathfinder.feetCell(p.getLocation());
+        double reach = reach(nms);
+        int[][] around = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (int[] d : around) {
+            int x = from.x() + d[0];
+            int y = from.y() + d[1];
+            int z = from.z() + d[2];
+            if (y < world.getMinHeight() || y >= world.getMaxHeight() || !world.isChunkLoaded(x >> 4, z >> 4)) {
+                continue;
+            }
+            Block nb = world.getBlockAt(x, y, z);
+            if (nb.getType() != material || blacklist.contains(Pathfinder.posOf(nb))) {
+                continue;
+            }
+            if (Pathfinder.canMine(world, stand, nb, reach) && canFitDrops(p, nb)) {
+                target = nb;
+                misses = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Mô tả ngắn trạng thái hiện tại, cho lệnh {@code /fpautomine status}. */
+    String describe() {
+        StringBuilder sb = new StringBuilder("đang đào ").append(materialName())
+                .append(", đã đào ").append(mined)
+                .append(limit < 0 ? " (không giới hạn)" : " / " + limit);
+        sb.append("; pha: ").append(switch (phase) {
+            case PLAN -> "lập kế hoạch";
+            case WALK -> "đi tới " + walkName();
+            case MINE -> "đào";
+            case VERIFY -> "kiểm tra";
+        });
+        if (escaping) {
+            sb.append("; đang thoát hiểm");
+        }
+        if (scanning) {
+            sb.append("; đang quét block (bán kính ").append(Settings.scanRadii[scanLevel]).append(")");
+        }
+        if (asyncJob != null || pendingSearch != null) {
+            sb.append("; đang tính đường");
+        }
+        sb.append("; rương đã nhớ ").append(knownChests.size());
+        sb.append("; khám phá ").append(explored).append(" / ").append(MAX_EXPLORE);
+        return sb.toString();
+    }
+
+    private String walkName() {
+        if (walkKind == null) {
+            return "";
+        }
+        return switch (walkKind) {
+            case BLOCK -> "block";
+            case CHEST -> "rương";
+            case ITEM -> "đồ rơi";
+            case EXPLORE -> "khám phá";
+            case ESCAPE -> "thoát hiểm";
+        };
     }
 
     // ------------------------------------------------------------------ PLAN
@@ -279,9 +391,9 @@ final class AutoMineSession {
         Item drop = nearestDrop(p);
         if (drop != null) {
             Location dropLoc = drop.getLocation();
-            Pathfinder.Result r = resumable("drop:" + drop.getUniqueId() + "@" + stand,
-                    () -> new Pathfinder.Search(world, stand, cell -> Pathfinder.nearPoint(cell, dropLoc),
-                            Pathfinder.posAt(dropLoc), Pathfinder.MAX_NODES, false, false, false, false));
+            Pathfinder.Result r = planGeometric(world, "drop:" + drop.getUniqueId() + "@" + stand, stand,
+                    cell -> Pathfinder.nearPoint(cell, dropLoc), Pathfinder.posAt(dropLoc),
+                    false, false, false);
             if (r == null) {
                 halt(nms);
                 return;
@@ -333,9 +445,8 @@ final class AutoMineSession {
             exploreHint = randomHint(stand);
         }
         Pathfinder.Pos hint = exploreHint;
-        Pathfinder.Result r = resumable("explore:" + hint + "@" + stand,
-                () -> new Pathfinder.Search(world, stand, cell -> cell.equals(hint), hint,
-                        Pathfinder.MAX_NODES, true, true, canPlaceBlocks(p), false));
+        Pathfinder.Result r = planGeometric(world, "explore:" + hint + "@" + stand, stand,
+                cell -> cell.equals(hint), hint, true, canPlaceBlocks(p), true);
         if (r == null) {
             halt(nms);
             return;
@@ -384,14 +495,33 @@ final class AutoMineSession {
                     return new Plan(next, List.of(), false);
                 }
                 candidate = next;
-                candidateBuild = false;
+                candidateStage = 0;
             }
             Block b = candidate;
             Pathfinder.Pos key = Pathfinder.posOf(b);
-            if (!candidateBuild) {
-                // Đường đi bộ tới ô đào được block này.
-                Pathfinder.Result r = resumable("walk:" + key + "@" + stand,
-                        () -> new Pathfinder.Search(world, stand,
+            if (candidateStage == 0) {
+                // Đi bộ bất đồng bộ tới ô trong tầm có tia nhìn xấp xỉ; đích được kiểm tra lại bằng canMine.
+                if (Settings.asyncPathfinding) {
+                    Pathfinder.Result r = asyncSearch(world, "walk:" + key + "@" + stand, stand,
+                            view -> new Pathfinder.Search(view, stand,
+                                    cell -> Pathfinder.inReachOf(cell, key, reach) && Pathfinder.losClear(view, cell, key),
+                                    key, Pathfinder.MAX_NODES, false, false, false, false));
+                    if (r == null) {
+                        waiting = true;
+                        return null;
+                    }
+                    Pathfinder.Pos end = r.path().isEmpty() ? stand : r.path().get(r.path().size() - 1);
+                    if (r.reached() && Pathfinder.canMine(world, end, b, reach)) {
+                        endTargetSearch();
+                        return new Plan(b, r.path(), false);
+                    }
+                }
+                candidateStage = 1;
+            }
+            if (candidateStage == 1) {
+                // Đi bộ chính xác trên thread chính: tia nhìn thật được tính trong goal.
+                Pathfinder.Result r = resumable("exact:" + key + "@" + stand,
+                        () -> new Pathfinder.Search(BlockView.of(world), stand,
                                 cell -> Pathfinder.canMine(world, cell, b, reach),
                                 key, Pathfinder.MAX_NODES, false, false, false, false));
                 if (r == null) {
@@ -402,12 +532,12 @@ final class AutoMineSession {
                     endTargetSearch();
                     return new Plan(b, r.path(), false);
                 }
-                candidateBuild = true;
+                candidateStage = 2;
             }
             // Không có đường đi bộ: được phép đào xuyên block để tới nguyên liệu.
             if (targetBuilds < MAX_BUILD_TARGETS) {
                 Pathfinder.Result built = resumable("build:" + key + "@" + stand,
-                        () -> new Pathfinder.Search(world, stand,
+                        () -> new Pathfinder.Search(BlockView.of(world), stand,
                                 cell -> Pathfinder.canMine(world, cell, b, reach),
                                 key, Pathfinder.MAX_BUILD_NODES, false, true, canPlaceBlocks(p), false));
                 if (built == null) {
@@ -422,7 +552,7 @@ final class AutoMineSession {
             }
             blacklist.add(key);
             candidate = null;
-            candidateBuild = false;
+            candidateStage = 0;
         }
         endTargetSearch();
         return null;
@@ -431,7 +561,7 @@ final class AutoMineSession {
     /** Kết thúc một đợt chọn block mục tiêu: xoá trạng thái thử nghiệm dở. */
     private void endTargetSearch() {
         candidate = null;
-        candidateBuild = false;
+        candidateStage = 0;
         targetTries = 0;
         targetBuilds = 0;
     }
@@ -517,6 +647,8 @@ final class AutoMineSession {
         scanMinY = Math.max(world.getMinHeight(), scanBy - SEARCH_RADIUS_Y);
         scanMaxY = Math.min(world.getMaxHeight() - 1, scanBy + SEARCH_RADIUS_Y);
         scanIndex = 0;
+        scanLevel = 0;
+        scanPrevRadius = 0;
         scanFound = new ArrayList<>();
         scanOrigin = loc.clone();
         scanning = true;
@@ -528,17 +660,22 @@ final class AutoMineSession {
      */
     private boolean continueScan(Player p) {
         World world = p.getWorld();
-        int side = 2 * SEARCH_RADIUS_XZ + 1;
+        int r = Settings.scanRadii[scanLevel];
+        int side = 2 * r + 1;
         int height = scanMaxY - scanMinY + 1;
         int total = side * side * height;
-        int units = Throttle.take(SCAN_UNITS_PER_STEP);
+        int units = Throttle.take(Settings.scanUnitsPerStep);
         int before = scanIndex;
         int end = Math.min(total, scanIndex + units);
         for (; scanIndex < end; scanIndex++) {
             // Chỉ số ô -> (x, z, y), đi theo x ngoài cùng, rồi z, rồi y (giống vòng lặp lồng nhau).
-            int x = scanBx - SEARCH_RADIUS_XZ + scanIndex / (side * height);
-            int z = scanBz - SEARCH_RADIUS_XZ + (scanIndex / height) % side;
+            int x = scanBx - r + scanIndex / (side * height);
+            int z = scanBz - r + (scanIndex / height) % side;
             int y = scanMinY + scanIndex % height;
+            // Ô nằm trong vòng đã quét ở bán kính trước: bỏ qua, không quét lại.
+            if (Math.max(Math.abs(x - scanBx), Math.abs(z - scanBz)) <= scanPrevRadius) {
+                continue;
+            }
             if (!world.isChunkLoaded(x >> 4, z >> 4)) {
                 continue;
             }
@@ -552,6 +689,13 @@ final class AutoMineSession {
         }
         Throttle.refund(units - (scanIndex - before));
         if (scanIndex < total) {
+            return false;
+        }
+        // Hết vòng bán kính này mà chưa thấy block nào: mở rộng sang bán kính lớn hơn.
+        if (scanFound.isEmpty() && scanLevel + 1 < Settings.scanRadii.length) {
+            scanPrevRadius = Settings.scanRadii[scanLevel];
+            scanLevel++;
+            scanIndex = 0;
             return false;
         }
         // Thứ tự đào: theo lớp (khoảng cách Chebyshev) tăng dần; trong cùng lớp theo
@@ -801,7 +945,7 @@ final class AutoMineSession {
     private boolean clearBlock(Player p, NMSServerPlayer nms, Block b, Pathfinder.Pos stand) {
         if (!Pathfinder.clearable(b.getWorld(), b.getX(), b.getY(), b.getZ())
                 || b.getLocation().distance(p.getLocation()) > REACH_LIMIT + 1.0
-                || !Safety.breakSafe(b.getWorld(), stand, b)) {
+                || !Safety.breakSafe(BlockView.of(b.getWorld()), stand, b)) {
             return false;
         }
         selectTool(p, nms, b);
@@ -892,7 +1036,7 @@ final class AutoMineSession {
         }
     }
 
-    private void verify() {
+    private void verify(Player p, NMSServerPlayer nms) {
         Block t = verifying;
         verifying = null;
         if (t == null) {
@@ -906,6 +1050,11 @@ final class AutoMineSession {
             misses = 0;
             breakFailures.remove(key);
             cooldown = BLOCK_COOLDOWN_TICKS;
+            // Đào theo mạch: block cùng loại kề bên đào được ngay thì đào luôn, khỏi tìm đường.
+            if (Settings.veinMining && (limit < 0 || mined < limit) && tryVein(p, nms, key)) {
+                phase = Phase.MINE;
+                return;
+            }
         } else if (breakFailures.merge(key, 1, Integer::sum) >= MAX_BREAK_FAILURES) {
             blacklist.add(key);
         }
@@ -1121,7 +1270,7 @@ final class AutoMineSession {
      */
     private static void sweepMobs(Player p) {
         Location loc = p.getLocation();
-        double r = MOB_SWEEP_RADIUS;
+        double r = Settings.mobSweepRadius;
         double maxSq = r * r;
         for (Entity e : p.getWorld().getNearbyEntities(loc, r, r, r)) {
             if (!(e instanceof Monster || e instanceof Bat || e instanceof Phantom)) {

@@ -23,7 +23,7 @@ Ví dụ:
 /fpautomine start minecraft:stone 128 Miner01  # đào 128 đá bằng dạng ngắn
 ```
 
-Dừng: `/fp action stop mine [tên bot]`.
+Dừng: `/fp action stop mine [tên bot]`. Xem trạng thái: `/fpautomine status [tên bot]`.
 
 Gõ phím Tab sau `mine` để gợi ý: tên block (ví dụ `stone`), số lượng gợi ý (`-`, `16`, `64`, `128`...), và tên bot của bạn (mọi bot nếu bạn là admin).
 
@@ -93,6 +93,9 @@ Giới hạn: lộ trình chỉ dựa vào trạng thái block hiện có. Addon
 | `Pathfinder` | Tìm đường A* trên lưới block, có chế độ khám phá và thoát hiểm |
 | `Safety` | Quy tắc an toàn: void, ngạt, chất lỏng/lửa, block rơi, rơi cao |
 | `Throttle` | Ngân sách công việc nặng mỗi tick server, dùng chung cho mọi bot, tự giảm khi server chậm |
+| `BlockView` | Nguồn đọc block: đọc thế giới (thread chính) hoặc ảnh chụp chunk (thread phụ) |
+| `AsyncPlanner` | Chụp ảnh chunk, giao việc tìm đường cho thread phụ và trả kết quả về |
+| `Settings` | Đọc `config.yml`, kẹp giá trị trong khoảng hợp lệ |
 | `CommandListener` | Chặn lệnh `/fp action start mine ...` và khởi chạy action |
 | `FPAutoMinePlugin` | Điểm vào của plugin, đăng ký action và listener |
 
@@ -104,7 +107,29 @@ Việc nặng nhất (tìm đường A*, quét block quanh bot) không chạy tr
 - Mỗi bot chỉ mở rộng tối đa 400 nút A* và quét tối đa 3000 ô mỗi tick; toàn bộ server dùng chung khoảng 375 nút A* hoặc 6000 ô mỗi tick.
 - Hệ quả: bot có thể đứng chờ vài tick (vài phần mười giây) trước khi bắt đầu đi tới block mới, nhất là khi có nhiều bot cùng chạy.
 - Các mob-sweep của các bot được lệch ngẫu nhiên, không quét cùng tick.
+- Tìm đường đi bộ tới block, tới đồ rơi và khám phá chạy trên thread phụ (`search.async`), dùng ảnh chụp chunk. Kết quả luôn được kiểm tra lại trên thread chính trước khi bot đi.
+- Quét block mở rộng dần theo bán kính (8, 16, 24 mặc định): block gần được tìm thấy trước, không phải quét hết hộp lớn.
 - Việc cất đồ (tìm đường tới rương) và thoát hiểm vẫn chạy đồng bộ trong một tick, vì cần kết quả ngay.
+
+## Cấu hình
+
+File `plugins/FPAutoMine/config.yml` được tạo khi bật plugin lần đầu. Sửa xong thì khởi động lại server để áp dụng.
+
+| Khoá | Mặc định | Ý nghĩa |
+|---|---|---|
+| `throttle.full-units` | 6000 | Ngân sách công việc nặng mỗi tick cho cả server; tự giảm khi server chậm |
+| `throttle.expand-cost` | 16 | Số đơn vị một nút A* tốn |
+| `search.step-nodes` | 400 | Số nút A* tối đa một bot mở rộng mỗi tick (đường đồng bộ) |
+| `search.async` | true | Tìm đường đi bộ trên thread phụ; đặt `false` nếu gặp lỗi lạ |
+| `scan.units-per-step` | 3000 | Số ô tối đa một bot quét mỗi tick |
+| `scan.radii` | [8, 16, 24] | Bán kính quét ngang, tăng dần |
+| `mining.vein` | true | Đào theo mạch: block cùng loại kề bên được đào luôn, không tìm đường |
+| `mob-sweep.interval-ticks` | 60 | Chu kỳ quét quái, tính bằng tick |
+| `mob-sweep.radius` | 25.0 | Bán kính quét quái, tính bằng block |
+
+## Trạng thái bot
+
+`/fpautomine status [tên bot]` cho biết bot đang ở pha nào (lập kế hoạch, đi, đào, kiểm tra), đã đào bao nhiêu, có đang quét hoặc đang tính đường không, số rương đã nhớ và số lượt khám phá.
 
 ## Hạn chế và trạng thái kiểm thử
 

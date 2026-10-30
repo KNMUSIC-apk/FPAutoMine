@@ -1,0 +1,32 @@
+# FPAutoMine: cấu hình hiệu năng và tính năng.
+# Sau khi sửa, khởi động lại server để áp dụng. Xoá một dòng thì dùng mặc định.
+
+throttle:
+  # Ngân sách công việc nặng mỗi tick server, dùng chung cho mọi bot.
+  # 6000 đơn vị ≈ 375 nút A* hoặc 6000 ô quét. Khi server chậm, plugin tự giảm xuống.
+  full-units: 6000
+  # Số đơn vị mà một nút A* tốn. Tăng lên thì tổng công việc tìm đường giảm.
+  expand-cost: 16
+
+search:
+  # Số nút A* tối đa một bot mở rộng trong một tick.
+  step-nodes: 400
+  # Tìm đường đi bộ trên thread phụ (dùng ảnh chụp chunk), không chặn server.
+  # Tắt (false) nếu gặp lỗi lạ: plugin sẽ tìm đường trên thread chính.
+  async: true
+
+scan:
+  # Số ô tối đa một bot quét trong một tick.
+  units-per-step: 3000
+  # Các bán kính quét ngang, tăng dần: quét gần trước, dừng khi thấy block.
+  radii: [8, 16, 24]
+
+mining:
+  # Đào theo mạch: sau khi đào xong, đào luôn các block cùng loại kề bên mà không cần tìm đường.
+  vein: true
+
+mob-sweep:
+  # Chu kỳ quét quái, tính bằng tick (20 tick = 1 giây).
+  interval-ticks: 60
+  # Bán kính quét quái quanh bot, tính bằng block.
+  radius: 25.0

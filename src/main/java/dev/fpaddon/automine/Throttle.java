@@ -4,23 +4,23 @@ import org.bukkit.Bukkit;
 
 /**
  * Ngân sách công việc nặng (mở rộng nút A*, quét block) dùng chung cho MỌI bot trong MỘT tick
- * của server, để số bot tăng thì tổng tải cũng bị chặn. Khi server đang chậm (thời gian mỗi tick
- * cao), ngân sách tự giảm để addon không làm tụt TPS thêm.
+ * của server, để số bot tăng thì tổng tải cũng bị chặn. Khi server đang chậm (thời gian mỗi tick cao),
+ * ngân sách tự giảm để addon không làm tụt TPS thêm. Các con số lấy từ {@link Settings}.
  *
- * <p>Đơn vị: 1 đơn vị ≈ một lần tra cứu block. Một lần mở rộng nút A* tốn {@link #EXPAND_COST} đơn vị.
+ * <p>Đơn vị: 1 đơn vị ≈ một lần tra cứu block. Một lần mở rộng nút A* tốn {@link #expandCost()} đơn vị.
  */
 final class Throttle {
 
-    /** Ngân sách đầy đủ mỗi tick khi server khoẻ: khoảng 375 nút A* hoặc 6000 ô quét (ước chừng ~1–2 ms). */
-    static final int FULL_UNITS = 6000;
-    /** Một lần mở rộng nút A* tốn chừng này đơn vị (mỗi nút tra cứu ~20 ô và cấp phát bộ nhớ). */
-    static final int EXPAND_COST = 16;
-
     private static long currentTick = -1;
     private static int used;
-    private static int limit = FULL_UNITS;
+    private static int limit = Settings.throttleFullUnits;
 
     private Throttle() {
+    }
+
+    /** Số đơn vị một nút A* tốn. */
+    static int expandCost() {
+        return Settings.throttleExpandCost;
     }
 
     /** Xin tối đa {@code want} đơn vị trong tick này. Trả về số được cấp (có thể bằng 0). */
@@ -49,13 +49,14 @@ final class Throttle {
 
     /** Giảm ngân sách khi thời gian mỗi tick tăng (50 ms là 20 TPS). */
     private static int scaledLimit() {
+        int full = Settings.throttleFullUnits;
         double ms = Bukkit.getAverageTickTime();
         if (ms <= 0 || ms < 40.0) {
-            return FULL_UNITS;
+            return full;
         }
         if (ms < 50.0) {
-            return FULL_UNITS / 2;
+            return full / 2;
         }
-        return FULL_UNITS / 5;
+        return full / 5;
     }
 }
