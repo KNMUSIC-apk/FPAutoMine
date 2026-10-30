@@ -29,7 +29,15 @@ public final class FPAutoMinePlugin extends JavaPlugin {
                 AutoMineAction.class, ACTION_NAME, "continuous", handler);
         getServer().getPluginManager().registerEvents(new CommandListener(api, handler), this);
         getServer().getPluginManager().registerEvents(new MobListener(api), this);
+        for (String warning : Settings.warnings) {
+            getLogger().warning(warning);
+        }
         getLogger().info("Đã đăng ký action '" + ACTION_NAME + "'. Dùng: /fp action start mine <block> [số lượng|-] [tên bot]");
+        if (Settings.aiEnabled) {
+            new AiController(this, api).start();
+        } else {
+            getLogger().info("AI tắt (ai.enabled: false trong config.yml).");
+        }
     }
 
     private static boolean isFolia() {

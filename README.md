@@ -126,6 +126,22 @@ File `plugins/FPAutoMine/config.yml` được tạo khi bật plugin lần đầ
 | `mining.vein` | true | Đào theo mạch: block cùng loại kề bên được đào luôn, không tìm đường |
 | `mob-sweep.interval-ticks` | 60 | Chu kỳ quét quái, tính bằng tick |
 | `mob-sweep.radius` | 25.0 | Bán kính quét quái, tính bằng block |
+| `ai.enabled` | false | Bật bot AI. Tắt thì plugin không gọi mạng |
+| `ai.model` | claude-haiku-5-5 | Mô hình Claude dùng để quyết định |
+| `ai.api-key-env` | ANTHROPIC_API_KEY | Tên biến môi trường chứa khoá API. Khoá không ghi trong config |
+| `ai.decision-interval-ticks` | 600 | Chu kỳ hỏi AI cho mỗi bot (600 tick = 30 giây) |
+| `ai.max-calls-per-hour` | 120 | Số lần gọi Claude tối đa mỗi giờ, cho mọi bot |
+| `ai.bots` | [] | Danh sách bot tự spawn khi bật plugin: `name`, và tuỳ chọn `world`, `x`, `y`, `z` |
+
+## Bot AI
+
+Bật bằng `ai.enabled: true`, khai báo bot trong `ai.bots`, rồi đặt khoá vào biến môi trường (ví dụ `export ANTHROPIC_API_KEY=...`) trước khi khởi động server. Thiếu biến môi trường thì AI không chạy và log ghi rõ lý do.
+
+- Bot được spawn bằng lệnh console `fp spawn <tên>`, nên không thuộc người chơi nào. Chỉ admin (`fakeplayer.admin`) và console điều khiển được. Dừng khai thác: `/fpautomine stop <tên>`. Xoá bot: `/fp remove <tên>`.
+- Mỗi chu kỳ, plugin gửi cho Claude các số liệu của bot (đói, máu, ban đêm, số quái gần, có đồ ăn, có cuốc). Không gửi tên người chơi hay chat.
+- Claude chỉ được chọn `gather` với block trong danh sách cho phép (gỗ `*_LOG`, quặng `*_ORE`, và STONE, DEEPSLATE, COBBLESTONE, DIRT, GRAVEL, SAND, CLAY, NETHERRACK) hoặc `rest`. Câu trả lời ngoài danh sách bị bỏ qua.
+- Bot đang ở trong nước hoặc lửa thì không hỏi AI.
+- Chưa có: chạy trốn, ăn, đánh quái, ngủ (giai đoạn M2); tôn trọng plugin bảo vệ (WorldGuard, GriefPrevention); bot tự báo là bot trong chat; kết bạn và liên minh.
 
 ## Trạng thái bot
 

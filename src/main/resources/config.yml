@@ -30,3 +30,27 @@ mob-sweep:
   interval-ticks: 60
   # Bán kính quét quái quanh bot, tính bằng block.
   radius: 25.0
+
+ai:
+  # Bật bot AI. Tắt (false) thì plugin hoạt động như cũ, không gọi mạng.
+  enabled: false
+  # Mô hình Claude dùng để quyết định.
+  model: claude-haiku-5-5
+  # Tên biến môi trường chứa khoá API. KHÔNG ghi khoá vào file này.
+  # Ví dụ Linux: export ANTHROPIC_API_KEY=... rồi khởi động lại server.
+  api-key-env: ANTHROPIC_API_KEY
+  # Chu kỳ hỏi AI cho mỗi bot, tính bằng tick (600 tick = 30 giây).
+  decision-interval-ticks: 600
+  # Số lần gọi Claude tối đa trong một giờ, cho mọi bot cộng lại. Đạt giới hạn thì tạm dừng hỏi.
+  max-calls-per-hour: 120
+  # Các bot tự spawn khi bật plugin. Bot không có chủ: chỉ admin và console điều khiển được
+  # (dừng bằng /fpautomine stop <tên>, xoá bằng /fp remove <tên>).
+  # Bỏ x, y, z thì bot spawn ở điểm spawn của thế giới.
+  bots: []
+  # Ví dụ:
+  # bots:
+  #   - name: Miner01
+  #     world: world
+  #     x: 0.5
+  #     y: 70
+  #     z: 0.5
